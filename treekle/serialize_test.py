@@ -492,7 +492,7 @@ class TestToPlain:
         monkeypatch.setattr(serialize, "_encode_node", counted)
         root = {"n": None, "i": 1, "s": "s", "f": value}
 
-        to_plain(root, dialect=dialect)
+        serialize._python_to_plain(root, dialect=dialect)
 
         assert encoded == [root]
 

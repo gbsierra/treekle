@@ -43,6 +43,8 @@ from zoneinfo import ZoneInfo
 
 import base64
 import json
+import os
+import warnings
 import weakref
 
 from treekle.plain import immutable
@@ -709,3 +711,31 @@ _ENCODER_CACHE: Final[weakref.WeakKeyDictionary[type, _Encoder]] = (
 # be weakly referenced. Each entry keeps its object, so the ``id`` is never
 # reused while the entry stands.
 _IMPORT_PATHS: Final[dict[int, tuple[object, str]]] = {}
+
+
+_python_to_plain: Final = to_plain
+"""The Python walker, used when the optional Rust core is unavailable."""
+
+
+if os.environ.get("TREEKLE_PURE_PYTHON", "") in {"", "0"}:
+    try:
+        from treekle._rust import (
+            setup_encode as _setup_rust,
+            to_plain as _rust_to_plain,
+        )
+    except ImportError:
+        pass
+    else:
+        # A core built from other sources imports fine but cannot set up
+        # against this module; Python must still serve rather than fail import.
+        try:
+            _setup_rust(globals())
+        except Exception as error:  # noqa: BLE001
+            warnings.warn(
+                f"treekle's Rust core does not match this treekle ({error}); "
+                "using the Python implementation until the core is rebuilt",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            to_plain = _rust_to_plain  # ty: ignore[invalid-assignment]

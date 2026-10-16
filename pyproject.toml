@@ -8,6 +8,7 @@ description = "Pickle semantics as plain python trees."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{name = "rekursiv.ai", email = "hello@rekursiv.ai"}]
 keywords = ["serialization", "json", "pickle", "dataclasses", "configuration"]
 classifiers = [
@@ -69,8 +70,8 @@ Issues = "https://github.com/rekursiv-ai/treekle/issues"
 Changelog = "https://github.com/rekursiv-ai/treekle/releases"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 # Tool settings: single source of truth.
 # Preferred location for any tool setting, in order:
@@ -82,13 +83,20 @@ build-backend = "hatchling.build"
 # .github/workflows/ci.yml only invokes the hooks and must not redefine any
 # of these.
 
-[tool.hatch.build.targets.wheel]
-packages = ["treekle"]
-exclude = ["**/*_test.py", "**/conftest.py"]
-artifacts = ["treekle/py.typed"]
-
-[tool.hatch.build.targets.sdist]
-exclude = [".github/**", ".codespell-ignore"]
+[tool.maturin]
+# The Rust core builds into treekle/_rust; treekle falls back to Python without it.
+manifest-path = "rust/Cargo.toml"
+module-name = "treekle._rust"
+python-source = "."
+profile = "release"
+features = ["pyo3/extension-module"]
+include = [{path = "CHANGELOG.md", format = "sdist"}]
+exclude = [
+    {path = "**/*_test.py", format = "wheel"},
+    {path = "**/conftest.py", format = "wheel"},
+    {path = ".github/**", format = "sdist"},
+    {path = ".codespell-ignore", format = "sdist"},
+]
 
 [tool.pytest.ini_options]
 python_files = ["*_test.py", "test_*.py"]
@@ -609,7 +617,7 @@ ignore-words = ".codespell-ignore"
 # Pre-commit exclude handles most skips. This covers direct CLI invocations.
 # Don't add new folder paths here -- add them to .pre-commit-config.yaml's
 # codespell exclude regex instead. This list is only for file patterns.
-skip = "htmlcov,.doctrees,*.pyc,*.ico,*.png,*.jpg,*.PNG,*.inv,*.dot,*.css,*.egg-info,uv.lock,__pycache__,.git,.venv,typings,**/third_party/"
+skip = "htmlcov,.doctrees,*.pyc,*.ico,*.png,*.jpg,*.PNG,*.inv,*.dot,*.css,*.egg-info,uv.lock,__pycache__,.git,.venv,target,typings,**/third_party/"
 # URLs, inline code spans, mixed-case identifiers, and fenced code blocks are
 # names, not prose; skipping them stops `-w` rewriting ``SimPy`` -> ``simply``.
 ignore-regex = '(?:https?://[^\s)>\]]+|`[^`\n]+`|\b\w*[a-z][A-Z]\w*\b)'
@@ -620,6 +628,14 @@ formats = "ipynb,py:percent"
 
 [tool.uv]
 package = true
+# Rebuild the Rust core when its sources change, not only pyproject.toml.
+cache-keys = [
+    {file = "pyproject.toml"},
+    {file = "rust/Cargo.toml"},
+    {file = "rust/Cargo.lock"},
+    {file = "rust/build.rs"},
+    {file = "rust/src/**/*.rs"},
+]
 environments = [
     "sys_platform == 'linux'",
     "sys_platform == 'darwin'",
