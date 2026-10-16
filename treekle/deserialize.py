@@ -441,14 +441,16 @@ def _tag_of(node: Mapping[str, PlainTree]) -> str | None:
 def _holds_tags(data: object) -> bool:
     """Return whether any mapping in ``data`` has a tag or escaped key."""
     stack = [data]
-    seen: set[int] = set()
+    # Keep each node, not just its id: a custom container may build new parts on
+    # every read, and a dropped part frees its id for the next one.
+    seen: dict[int, object] = {}
     while stack:
         node = stack.pop()
         if isinstance(node, (str, int, float)) or node is None:
             continue
         if id(node) in seen:
             continue
-        seen.add(id(node))
+        seen[id(node)] = node
         if isinstance(node, Mapping):
             mapping = cast("Mapping[object, object]", node)
             if any(
@@ -707,9 +709,24 @@ def _decode_int(
     if isinstance(data, int) and not isinstance(data, bool):
         return data
     if not state.strict and not isinstance(data, bool):
+        # Parse integer text directly. Through a float, it would round past 2**53,
+        # and text past the float range would turn into infinity and be refused.
+        if isinstance(data, str):
+            try:
+                return int(data)
+            except ValueError:
+                pass
         number = _lax_number(data)
         # ``is_integer`` is false for a non-finite float, so ``int`` cannot raise.
         if number is not None and number.is_integer():
+            # Parse float-form text, such as ``"9007199254740993.0"``, again as a
+            # ``Decimal`` to get its exact value. ``Decimal`` accepts any text
+            # ``float`` did. Text that is integral only after rounding to a float,
+            # such as ``"1.0000000000000000001"``, keeps the rounded value.
+            if isinstance(data, str):
+                exact = Decimal(data)
+                if exact == exact.to_integral_value():
+                    return int(exact)
             return int(number)
     raise ReadError(f"cannot read {_shown(data)} as int")
 
@@ -1083,9 +1100,13 @@ def _decode_key(
         except json.JSONDecodeError as error:
             raise ReadError(f"invalid escaped key {_shown(key)}") from error
     decoded = _decode(raw, target, at, state)
-    if not isinstance(decoded, Hashable):
-        raise ReadError(f"key {_shown(decoded)} is unhashable")
-    return decoded
+    # Call ``hash`` because the dict insert does. The ``Hashable`` check is not
+    # enough: it passes a tuple holding a list, and any class registered with it.
+    try:
+        hash(decoded)
+    except TypeError as error:
+        raise ReadError(f"key {_shown(decoded)} is unhashable") from error
+    return cast("Hashable", decoded)
 
 
 def _decode_type(
@@ -2009,15 +2030,16 @@ def _resolve_alias(target: object) -> object:
 
 
 # A cached value naming its own class would keep the weak key alive forever, so
-# only module-level classes whose hints do not name themselves are cached. An
-# unresolved hint is not cached either: its import may only be pending.
+# a class is cached only if its module leads to it by qualname and no hint names
+# it. That includes nested classes (such as configgle's ``Outer.Config``), since
+# evaluating their hints again is most of a typed read. An unresolved hint is not
+# cached either: its import may only be pending.
 def _field_types(kind: type) -> Mapping[str, object]:
     """Return a dataclass's state types (fields, then slots) or a TypedDict's, cached."""
     cached = _FIELD_TYPES.get(kind)
     if cached is not None:
         return cached
-    module_name: str = kind.__module__
-    qualname: str = kind.__qualname__
+    reached = _module_reaches(kind)
     hints, resolved = _resolvable_hints(kind, include_extras=False)
     names = (
         dict.fromkeys([item.name for item in fields(kind)] + list(slot_names(kind)))
@@ -2027,11 +2049,9 @@ def _field_types(kind: type) -> Mapping[str, object]:
     result = MappingProxyType(
         {name: _resolve_alias(hints.get(name, object)) for name in names},
     )
-    module = sys.modules.get(module_name)
     if (
         resolved
-        and module is not None
-        and vars(module).get(qualname) is kind
+        and reached
         and not any(
             hint is kind or kind in cast("tuple[object, ...]", get_args(hint))
             for hint in result.values()
@@ -2041,36 +2061,112 @@ def _field_types(kind: type) -> Mapping[str, object]:
     return result
 
 
+def _module_reaches(kind: type) -> bool:
+    """Return whether following ``kind``'s qualname from its module finds ``kind``."""
+    module = sys.modules.get(kind.__module__)
+    if module is None:
+        return False
+    first, *rest = kind.__qualname__.split(".")
+    found: object = vars(module).get(first)
+    # Only classes are followed, so a class defined in a function, such as
+    # ``f.<locals>.C``, is not found.
+    for name in rest:
+        if not isinstance(found, type):
+            return False
+        found = vars(found).get(name)
+    return found is kind
+
+
 # A hint naming what its module imports only for type checking does not resolve at
 # run time. Its field reads by its tags instead, so a value still reads back as the
 # type it was written from.
+#
+# Such a class is not cached, since the import may only be pending. But later
+# reads retry only the hints that failed. The ones that resolved are kept, under
+# the rules ``_field_types`` uses to cache a class, and once a failed hint
+# resolves, the class is read in full again.
 def _resolvable_hints(
     kind: type,
     *,
     include_extras: bool,
 ) -> tuple[dict[str, object], bool]:
     """Return ``kind``'s hints, ``object`` for each that does not resolve, and if all did."""
+    known = _PARTIAL_HINTS.get(kind, {}).get(include_extras)
+    if known is not None:
+        kept, retry = known
+        if not any(
+            _resolves(kind.__mro__[at], name, include_extras=include_extras)
+            for name, at in retry.items()
+        ):
+            return dict(kept), False
+        # Another thread may have dropped the entry since it was read.
+        _PARTIAL_HINTS.pop(kind, None)
     try:
         return get_type_hints(kind, include_extras=include_extras), True
     except (AttributeError, NameError, TypeError):
         pass
     hints: dict[str, object] = {}
-    for base in reversed(kind.__mro__):
-        module = sys.modules.get(base.__module__)
-        globalns = dict(vars(module)) if module is not None else {}
-        localns = dict(vars(base))
+    failed: dict[str, int] = {}
+    for at in reversed(range(len(kind.__mro__))):
+        base = kind.__mro__[at]
+        globalns, localns = _namespaces(base)
         for name, hint in _own_annotations(base).items():
-            single = SimpleNamespace(__annotations__={name: hint})
-            try:
-                hints[name] = get_type_hints(
-                    single,
-                    globalns,
-                    localns,
-                    include_extras=include_extras,
-                )[name]
-            except (AttributeError, NameError, TypeError):
+            hints[name] = _single_hint(
+                name,
+                hint,
+                globalns,
+                localns,
+                include_extras=include_extras,
+            )
+            failed.pop(name, None)
+            if hints[name] is PENDING:
                 hints[name] = object
+                failed[name] = at
+    if _module_reaches(kind) and not any(
+        hint is kind or kind in cast("tuple[object, ...]", get_args(hint))
+        for hint in hints.values()
+    ):
+        _PARTIAL_HINTS.setdefault(kind, {})[include_extras] = (dict(hints), failed)
     return hints, False
+
+
+def _resolves(base: type, name: str, *, include_extras: bool) -> bool:
+    """Return whether ``base``'s own annotation ``name`` resolves now, or is gone."""
+    hint = _own_annotations(base).get(name, PENDING)
+    if hint is PENDING:
+        return True
+    globalns, localns = _namespaces(base)
+    resolved = _single_hint(
+        name, hint, globalns, localns, include_extras=include_extras
+    )
+    return resolved is not PENDING
+
+
+def _namespaces(base: type) -> tuple[dict[str, object], dict[str, object]]:
+    """Return the globals and locals ``base``'s annotations are evaluated in."""
+    module = sys.modules.get(base.__module__)
+    return (dict(vars(module)) if module is not None else {}), dict(vars(base))
+
+
+def _single_hint(
+    name: str,
+    hint: object,
+    globalns: dict[str, object],
+    localns: dict[str, object],
+    *,
+    include_extras: bool,
+) -> object:
+    """Resolve one annotation by itself, or return ``PENDING`` if it fails."""
+    single = SimpleNamespace(__annotations__={name: hint})
+    try:
+        return get_type_hints(
+            single,
+            globalns,
+            localns,
+            include_extras=include_extras,
+        )[name]
+    except (AttributeError, NameError, TypeError):
+        return PENDING
 
 
 def _own_annotations(base: type) -> dict[str, object]:
@@ -2274,3 +2370,12 @@ _RESOLVED: Final[dict[str, object]] = {}
 _FIELD_TYPES: Final[weakref.WeakKeyDictionary[type, Mapping[str, object]]] = (
     weakref.WeakKeyDictionary()
 )
+
+
+_PARTIAL_HINTS: Final[
+    weakref.WeakKeyDictionary[
+        type, dict[bool, tuple[dict[str, object], dict[str, int]]]
+    ]
+] = weakref.WeakKeyDictionary()
+"""For each class with failed hints, keyed by ``include_extras``: its hints, and for
+each failed name, the MRO index of the base that declared it."""
