@@ -273,7 +273,7 @@ default choice until making treekle).
 
 | | [treekle](https://github.com/rekursiv-ai/treekle) | [pickle](https://docs.python.org/3/library/pickle.html) | [jsonpickle](https://github.com/jsonpickle/jsonpickle) | [pydantic](https://github.com/pydantic/pydantic) | [msgspec](https://github.com/jcrist/msgspec) | [cattrs](https://github.com/python-attrs/cattrs) | [mashumaro](https://github.com/Fatal1ty/mashumaro) |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| C/Rust | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
+| C/Rust | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ |
 | stdlib | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | plain | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | typed result | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
@@ -289,7 +289,7 @@ default choice until making treekle).
 [open a PR](https://github.com/rekursiv-ai/treekle/pulls).
 
 - **C/Rust:** the core is a compiled extension, not pure Python.
-- **stdlib:** part of, or pure Python importing only, the standard library.
+- **stdlib:** part of the standard library, or importing nothing outside it.
 - **plain:** encodes to plain dicts, lists, and scalars, so any writer stores
   it: JSON, YAML, TOML.
 - **typed result:** a type checker infers `T` from `decode(data, T)`, not

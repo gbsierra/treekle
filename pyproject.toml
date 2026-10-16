@@ -19,6 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
     "Topic :: Software Development :: Libraries",
     "Typing :: Typed",
 ]
@@ -97,6 +98,15 @@ exclude = [
     {path = ".github/**", format = "sdist"},
     {path = ".codespell-ignore", format = "sdist"},
 ]
+
+# The Python-only universal wheel, which scripts/build_pure_wheel.py builds with
+# hatchling. Maturin builds everything else and ignores this table.
+[tool.hatch.build.targets.wheel]
+packages = ["treekle"]
+exclude = ["*_test.py", "conftest.py", "*.so", "*.pyd"]
+# Maturin's version, so every release file declares the same one. Hatchling
+# 1.32 defaults to 2.5, which PyPI uploads have rejected.
+core-metadata-version = "2.4"
 
 [tool.pytest.ini_options]
 python_files = ["*_test.py", "test_*.py"]
@@ -206,6 +216,9 @@ do_not_mutate_patterns = [
 # 43 s untraced, past the 60 s test timeout. COVERAGE_CORE still overrides it,
 # as the testmon hooks' ctrace does.
 core = "sysmon"
+# Tests run the fallback wiring and the release scripts in child processes;
+# measure those too, or the lines they cover count as missed.
+patch = ["subprocess"]
 omit = [
     "*_test.py",
     "test_*.py",
