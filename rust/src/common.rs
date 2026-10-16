@@ -5,7 +5,7 @@ use std::cell::UnsafeCell;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyIterator, PyString, PyTuple};
+use pyo3::types::{PyDict, PyIterator, PyList, PyString, PyTuple};
 
 pub type B<'py> = Bound<'py, PyAny>;
 
@@ -240,6 +240,26 @@ pub struct Stamp {
 }
 
 impl Stamp {
+    /// The class's current state, or ``None`` if it cannot change.
+    pub fn of(class: &B<'_>) -> Option<Self> {
+        let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
+        unsafe {
+            if ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_IMMUTABLETYPE) != 0 {
+                return None;
+            }
+            if (*kind).tp_version_tag == 0 {
+                // A class out of tags stays at 0, which never matches.
+                PyUnstable_Type_AssignVersionTag(kind);
+            }
+            let qualname = heap_qualname(kind);
+            Some(Self {
+                tag: (*kind).tp_version_tag,
+                qualname: (!qualname.is_null())
+                    .then(|| Py::from_borrowed_ptr(class.py(), qualname)),
+            })
+        }
+    }
+
     /// The class's current state, immutable classes included. A fact kept
     /// across calls by class address needs this: version tags are never
     /// reused, so a new class that takes a dead one's address never matches.
@@ -302,6 +322,8 @@ type_ptr!(t_str, PyUnicode_Type);
 type_ptr!(t_int, PyLong_Type);
 type_ptr!(t_float, PyFloat_Type);
 type_ptr!(t_bool, PyBool_Type);
+type_ptr!(t_proxy, PyDictProxy_Type);
+type_ptr!(t_object, PyBaseObject_Type);
 
 #[inline(always)]
 pub fn t_none() -> *mut ffi::PyTypeObject {
@@ -324,8 +346,28 @@ pub fn is_float(obj: &B<'_>) -> bool {
 }
 
 #[inline(always)]
+pub fn is_tuple(obj: &B<'_>) -> bool {
+    unsafe { ffi::PyTuple_Check(obj.as_ptr()) != 0 }
+}
+
+#[inline(always)]
+pub fn is_list(obj: &B<'_>) -> bool {
+    unsafe { ffi::PyList_Check(obj.as_ptr()) != 0 }
+}
+
+#[inline(always)]
+pub fn is_dict(obj: &B<'_>) -> bool {
+    unsafe { ffi::PyDict_Check(obj.as_ptr()) != 0 }
+}
+
+#[inline(always)]
 pub fn is_class(obj: &B<'_>) -> bool {
     unsafe { ffi::PyType_Check(obj.as_ptr()) != 0 }
+}
+
+#[inline(always)]
+pub fn is_callable(obj: &B<'_>) -> bool {
+    unsafe { ffi::PyCallable_Check(obj.as_ptr()) != 0 }
 }
 
 /// ``type(obj).__hash__ is None``: whether instances of ``obj``'s class opt
@@ -390,8 +432,22 @@ pub fn str_starts_any(obj: &B<'_>, prefixes: &[&str]) -> PyResult<bool> {
         .is_truthy()
 }
 
+/// ``isinstance(obj, str) and obj.startswith(prefix)``.
+#[inline]
+pub fn str_starts(obj: &B<'_>, prefix: &str) -> PyResult<bool> {
+    str_starts_any(obj, &[prefix])
+}
+
 pub fn repr(obj: &B<'_>) -> PyResult<String> {
     Ok(obj.repr()?.to_string_lossy().into_owned())
+}
+
+pub fn text(obj: &B<'_>) -> PyResult<String> {
+    Ok(obj.str()?.to_string_lossy().into_owned())
+}
+
+pub fn err_text(py: Python<'_>, err: &PyErr) -> PyResult<String> {
+    text(err.value(py).as_any())
 }
 
 /// ``obj == other`` with Python's identity shortcut.
@@ -404,6 +460,33 @@ pub fn py_eq(obj: &B<'_>, other: &B<'_>) -> PyResult<bool> {
         return Err(PyErr::fetch(obj.py()));
     }
     Ok(result == 1)
+}
+
+/// ``obj != other`` as a condition.
+pub fn py_ne(obj: &B<'_>, other: &B<'_>) -> PyResult<bool> {
+    let result = unsafe { ffi::PyObject_RichCompareBool(obj.as_ptr(), other.as_ptr(), ffi::Py_NE) };
+    if result < 0 {
+        return Err(PyErr::fetch(obj.py()));
+    }
+    Ok(result == 1)
+}
+
+/// Whether ``obj`` is an exact dict whose keys are all exact ``str``.
+pub fn is_str_keyed_dict(obj: &B<'_>) -> bool {
+    if tp(obj) != t_dict() {
+        return false;
+    }
+    let mut position: ffi::Py_ssize_t = 0;
+    let mut key = std::ptr::null_mut();
+    let mut value = std::ptr::null_mut();
+    unsafe {
+        while ffi::PyDict_Next(obj.as_ptr(), &mut position, &mut key, &mut value) != 0 {
+            if ffi::Py_TYPE(key) != t_str() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Every entry of an exact dict, read at once. No Python code runs while it
@@ -540,6 +623,55 @@ impl<'py> MapItems<'py> {
         match self {
             Self::Dict(items) => items.next_item(),
             Self::Iter(iter) => iter.next().transpose()?.map(unpack_pair).transpose(),
+        }
+    }
+}
+
+/// The items of any iterable, a list read live as its iterator would.
+pub enum SeqItems<'py> {
+    List(Bound<'py, PyList>, usize),
+    Tuple(Bound<'py, PyTuple>, usize),
+    Iter(Bound<'py, PyIterator>),
+}
+
+impl<'py> SeqItems<'py> {
+    pub fn new(seq: &B<'py>) -> PyResult<Self> {
+        let kind = tp(seq);
+        if kind == t_list() {
+            return Ok(Self::List(
+                unsafe { seq.cast_unchecked::<PyList>() }.clone(),
+                0,
+            ));
+        }
+        if kind == t_tuple() {
+            return Ok(Self::Tuple(
+                unsafe { seq.cast_unchecked::<PyTuple>() }.clone(),
+                0,
+            ));
+        }
+        Ok(Self::Iter(seq.try_iter()?))
+    }
+
+    #[inline]
+    pub fn next_item(&mut self) -> PyResult<Option<B<'py>>> {
+        match self {
+            Self::List(list, index) => {
+                if *index >= list.len() {
+                    return Ok(None);
+                }
+                let item = list.get_item(*index)?;
+                *index += 1;
+                Ok(Some(item))
+            }
+            Self::Tuple(tuple, index) => {
+                if *index >= tuple.len() {
+                    return Ok(None);
+                }
+                let item = tuple.get_item(*index)?;
+                *index += 1;
+                Ok(Some(item))
+            }
+            Self::Iter(iter) => iter.next().transpose(),
         }
     }
 }

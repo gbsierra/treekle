@@ -488,7 +488,7 @@ class TestTypedDecode:
         )
 
         with pytest.raises(ReadError):
-            from_plain(tree, _Nested)
+            deserialize._python_from_plain(tree, _Nested)
 
         assert len(calls) <= 2 * depth
 
@@ -2192,7 +2192,7 @@ class TestFastPath:
         resolved: list[object] = []
         monkeypatch.setattr(deserialize, "_resolve_alias", resolved.append)
 
-        assert from_plain(data, object) == expected
+        assert deserialize._python_from_plain(data, object) == expected
         assert resolved == []
 
     @pytest.mark.parametrize(("node", "reason"), _MALFORMED_NODES, ids=repr)
@@ -2568,7 +2568,8 @@ class TestForeignInput:
         # Each read builds a new list, and dropping it frees its id for the next
         # one. The tag scan must not mistake that list for one it already scanned.
         data = cast(
-            "PlainTree", [_FreshParts([{"py/tuple": [1, 2]}]), _FreshParts([1])]
+            "PlainTree",
+            [_FreshParts([{"py/tuple": [1, 2]}]), _FreshParts([1])],
         )
         assert from_plain(data, object) == [[[(1, 2)]], [[1]]]
 

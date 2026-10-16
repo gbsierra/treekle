@@ -61,9 +61,11 @@ import importlib
 import inspect
 import json
 import math
+import os
 import reprlib
 import sys
 import typing
+import warnings
 import weakref
 
 from treekle.absent import ABSENT
@@ -2137,7 +2139,11 @@ def _resolves(base: type, name: str, *, include_extras: bool) -> bool:
         return True
     globalns, localns = _namespaces(base)
     resolved = _single_hint(
-        name, hint, globalns, localns, include_extras=include_extras
+        name,
+        hint,
+        globalns,
+        localns,
+        include_extras=include_extras,
     )
     return resolved is not PENDING
 
@@ -2374,8 +2380,36 @@ _FIELD_TYPES: Final[weakref.WeakKeyDictionary[type, Mapping[str, object]]] = (
 
 _PARTIAL_HINTS: Final[
     weakref.WeakKeyDictionary[
-        type, dict[bool, tuple[dict[str, object], dict[str, int]]]
+        type,
+        dict[bool, tuple[dict[str, object], dict[str, int]]],
     ]
 ] = weakref.WeakKeyDictionary()
 """For each class with failed hints, keyed by ``include_extras``: its hints, and for
 each failed name, the MRO index of the base that declared it."""
+
+
+_python_from_plain: Final = from_plain
+"""The Python walker, used when the optional Rust core is unavailable."""
+
+
+if os.environ.get("TREEKLE_PURE_PYTHON", "") in {"", "0"}:
+    try:
+        from treekle._rust import (
+            from_plain as _rust_from_plain,
+            setup_decode as _setup_rust,
+        )
+
+        _setup_rust(globals())
+    except ModuleNotFoundError:
+        pass
+    # A core built from other sources may lack this module's functions or fail
+    # to set up against it; Python must still serve rather than fail import.
+    except Exception as error:  # noqa: BLE001
+        warnings.warn(
+            f"treekle's Rust core does not match this treekle ({error}); "
+            "using the Python implementation until the core is rebuilt",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    else:
+        from_plain = _rust_from_plain  # ty: ignore[invalid-assignment]

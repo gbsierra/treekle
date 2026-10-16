@@ -723,19 +723,18 @@ if os.environ.get("TREEKLE_PURE_PYTHON", "") in {"", "0"}:
             setup_encode as _setup_rust,
             to_plain as _rust_to_plain,
         )
-    except ImportError:
+
+        _setup_rust(globals())
+    except ModuleNotFoundError:
         pass
+    # A core built from other sources may lack this module's functions or fail
+    # to set up against it; Python must still serve rather than fail import.
+    except Exception as error:  # noqa: BLE001
+        warnings.warn(
+            f"treekle's Rust core does not match this treekle ({error}); "
+            "using the Python implementation until the core is rebuilt",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     else:
-        # A core built from other sources imports fine but cannot set up
-        # against this module; Python must still serve rather than fail import.
-        try:
-            _setup_rust(globals())
-        except Exception as error:  # noqa: BLE001
-            warnings.warn(
-                f"treekle's Rust core does not match this treekle ({error}); "
-                "using the Python implementation until the core is rebuilt",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        else:
-            to_plain = _rust_to_plain  # ty: ignore[invalid-assignment]
+        to_plain = _rust_to_plain  # ty: ignore[invalid-assignment]
