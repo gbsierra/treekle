@@ -14,6 +14,9 @@ from treekle import json_loads
 from treekle.types import Hooks, ReadError
 
 
+pytestmark = pytest.mark.usefixtures("implementation")
+
+
 class TestJsonLoads:
     def test_text_reads_as_a_mutable_tree(self) -> None:
         assert json_loads('{"a": [1, 2.5, null]}') == {"a": [1, 2.5, None]}

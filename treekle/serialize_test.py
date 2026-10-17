@@ -19,6 +19,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import datetime as dt
+import json
 import math
 import re
 import threading
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from treekle.types import Dialect, Hooks, MutablePlainTree
+
+
+pytestmark = pytest.mark.usefixtures("implementation")
 
 
 @pytest.fixture(autouse=True)
@@ -491,7 +495,7 @@ class TestToPlain:
         monkeypatch.setattr(serialize, "_encode_node", counted)
         root = {"n": None, "i": 1, "s": "s", "f": value}
 
-        to_plain(root, dialect=dialect)
+        serialize._python_to_plain(root, dialect=dialect)
 
         assert encoded == [root]
 
@@ -869,6 +873,46 @@ class TestRoundTrip:
 
         assert restored == value
         assert type(restored) is type(value)
+
+    def test_a_key_repeating_one_object_writes_it_in_full_each_time(self) -> None:
+        point = Point(x=1)
+        whole = to_plain(point)
+
+        tree = to_plain({(point, point): 1})
+
+        assert tree == {"json://" + json.dumps({"py/tuple": [whole, whole]}): 1}
+        restored = cast(
+            "dict[tuple[Point, Point], int]",
+            _round_trip({(point, point): 1}),
+        )
+        assert restored == {(point, point): 1}
+        first, second = next(iter(restored))
+        assert first is not second
+
+    def test_a_key_refers_to_a_value_written_before_it(self) -> None:
+        point = Point(x=1)
+        value = {"first": [point], (point, point): 1}
+        ref = {"py/ref": ["first", 0]}
+
+        tree = to_plain(value)
+
+        assert isinstance(tree, dict)
+        assert list(tree) == [
+            "first",
+            "json://" + json.dumps({"py/tuple": [ref, ref]}),
+        ]
+        restored = cast("dict[object, object]", _round_trip(value))
+        assert restored == value
+        key = next(key for key in restored if key != "first")
+        first = cast("list[Point]", restored["first"])
+        assert cast("tuple[Point, Point]", key)[0] is first[0]
+
+    def test_a_key_holding_a_cycle_is_refused(self) -> None:
+        looped = Member(owner=set[object]())
+        looped.owner.add(looped)
+
+        with pytest.raises(TypeError, match=r"^Cannot serialize a dict key holding"):
+            to_plain({looped: 1})
 
     def test_nan_survives(self) -> None:
         restored = _round_trip(math.nan)

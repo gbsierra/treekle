@@ -20,7 +20,7 @@ which builds, validates, and uploads to PyPI via OIDC trusted publishing
    | Workflow filename | `publish-pypi.yml` |
    | Environment name | `pypi` |
 
-   Environment name **must** be `pypi` (matches `publish-pypi.yml:16`).
+   Environment name **must** be `pypi` (matches `publish-pypi.yml:115`).
    Blank here = `invalid-publisher` at publish time.
 
 2. **Bump the version** in `pyproject.toml` (source of truth). Must
@@ -30,13 +30,15 @@ which builds, validates, and uploads to PyPI via OIDC trusted publishing
 
    `uv lock` first: the lockfile pins this package's own version, so
    building without it publishes an artifact whose lock still names the
-   previous one -- and `uv run` below resolves from the lock, so the smoke
-   test imports the OLD code and passes.
+   previous one.
 
    ```bash
    uv lock
-   uv build
-   uv run python -c "import treekle; print(treekle.__file__)"
+   rm -rf dist
+   uv build --out-dir dist
+   uv run --isolated --no-project --no-index --no-build --find-links dist --with treekle python -P -W error scripts/check_wheel.py native
+   uv run --isolated --no-project --with "$(uv run scripts/build_pure_wheel.py dist)" python -P -W error scripts/check_wheel.py python
+   uv run twine check --strict dist/*
    ```
 
 4. **Commit and merge to `main`.** Confirm the published version:
@@ -51,7 +53,7 @@ which builds, validates, and uploads to PyPI via OIDC trusted publishing
 
 6. **Watch the workflow:**
    ```bash
-   gh run watch --repo rekursiv-ai/treekle $(gh run list --repo rekursiv-ai/treekle --workflow publish-pypi.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+   gh run watch --repo rekursiv-ai/treekle $(gh run list --repo rekursiv-ai/treekle --workflow publish-pypi.yml --event release --limit 1 --json databaseId --jq '.[0].databaseId')
    ```
 
 7. **Confirm it's live:**
@@ -69,12 +71,16 @@ which builds, validates, and uploads to PyPI via OIDC trusted publishing
 - **Transient PyPI failure** — re-run without a new tag:
   `gh workflow run publish-pypi.yml --repo rekursiv-ai/treekle`.
 
-- **Must ship now, publishing still broken** — upload directly with the
-  project's API token (`rekursiv-ai`-owned, e.g. `$PYPI_TOKEN_WORK`; a
-  personal token can't publish `treekle`):
+- **Must ship now, publishing still broken** — upload the files the
+  release run built (every build job must have passed), with the
+  project's API token (`rekursiv-ai`-owned, e.g. `$PYPI_TOKEN_WORK`;
+  a personal token can't publish `treekle`). Don't upload a local
+  build: PyPI rejects its `linux_x86_64` wheel.
   ```bash
-  uv build --out-dir dist
-  uv run --with twine twine check dist/treekle-X.Y.Z*
-  uv run --with twine twine upload dist/treekle-X.Y.Z* -u __token__ -p "$PYPI_TOKEN_WORK"
+  run=$(gh run list --repo rekursiv-ai/treekle --workflow publish-pypi.yml --event release --limit 1 --json databaseId --jq '.[0].databaseId')
+  rm -rf dist
+  gh run download "$run" --repo rekursiv-ai/treekle --pattern 'dist-*' --dir dist
+  uv run --with twine twine check --strict dist/*/*
+  uv run --with twine twine upload dist/*/* -u __token__ -p "$PYPI_TOKEN_WORK"
   ```
   Permanent and public; PyPI never allows re-uploading a version.

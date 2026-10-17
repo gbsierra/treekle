@@ -16,6 +16,9 @@ from treekle.parse import parse
 from treekle.types import ReadError
 
 
+pytestmark = pytest.mark.usefixtures("implementation")
+
+
 class Mode(Enum):
     FAST = "fast"
     SLOW = 2
@@ -28,6 +31,10 @@ class TestParse:
 
     def test_a_quoted_json_string_reads_as_its_text(self) -> None:
         assert parse('"a b"', str) == "a b"
+
+    def test_quoted_text_reads_as_the_text_it_quotes(self) -> None:
+        assert parse('"7"', int) == 7
+        assert parse('"inf"', float) == math.inf
 
     @pytest.mark.parametrize(
         ("text", "target", "expected"),

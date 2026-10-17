@@ -1,0 +1,63 @@
+from typing import Literal, overload
+
+from treekle.types import Dialect, Hooks, MutablePlainTree, PlainTree
+
+def setup_encode(module: dict[str, object]) -> None: ...
+def setup_decode(module: dict[str, object]) -> None: ...
+@overload
+def to_plain(
+    obj: object,
+    *,
+    dialect: Dialect = ...,
+    mutable: Literal[True] = ...,
+    hooks: Hooks = ...,
+    sort: bool = ...,
+) -> MutablePlainTree: ...
+@overload
+def to_plain(
+    obj: object,
+    *,
+    dialect: Dialect = ...,
+    mutable: bool,
+    hooks: Hooks = ...,
+    sort: bool = ...,
+) -> PlainTree: ...
+@overload
+def from_plain[T](
+    data: object,
+    target: type[T],
+    *,
+    hooks: Hooks = ...,
+    allow_imports: bool = ...,
+    strict: bool = ...,
+) -> T: ...
+@overload
+def from_plain[T](
+    data: object,
+    target: type[T],
+    *,
+    default: None,
+    hooks: Hooks = ...,
+    allow_imports: bool = ...,
+    strict: bool = ...,
+) -> T | None: ...
+@overload
+def from_plain[T](
+    data: object,
+    target: type[T],
+    *,
+    default: T,
+    hooks: Hooks = ...,
+    allow_imports: bool = ...,
+    strict: bool = ...,
+) -> T: ...
+@overload
+def from_plain(
+    data: object,
+    target: object,
+    *,
+    default: object = ...,
+    hooks: Hooks = ...,
+    allow_imports: bool = ...,
+    strict: bool = ...,
+) -> object: ...

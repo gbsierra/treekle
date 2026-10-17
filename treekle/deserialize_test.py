@@ -28,6 +28,7 @@ from typing import (
     Union,  # pyright: ignore[reportDeprecated] -- Imported to test its pre-3.14 origin.
     cast,
     get_origin,
+    get_type_hints,
     override,
 )
 from uuid import UUID
@@ -58,6 +59,9 @@ from treekle.types import (
 
 if TYPE_CHECKING:
     from numbers import Rational
+
+
+pytestmark = pytest.mark.usefixtures("implementation")
 
 
 _T = TypeVar("_T")
@@ -234,6 +238,14 @@ class _RenamedOriginal:
 
 Renamed = _RenamedOriginal
 del _RenamedOriginal
+
+
+class Holder:
+    """Holds a dataclass, as a configgle class holds its ``Config``."""
+
+    @dataclass(frozen=True, kw_only=True, slots=True)
+    class Part:
+        x: int
 
 
 class Bundle(list[object]):
@@ -479,7 +491,7 @@ class TestTypedDecode:
         )
 
         with pytest.raises(ReadError):
-            from_plain(tree, _Nested)
+            deserialize._python_from_plain(tree, _Nested)
 
         assert len(calls) <= 2 * depth
 
@@ -1976,6 +1988,11 @@ class TestBadParts:
                 {("json://[1]",): "key [1] is unhashable"},
             ),
             (
+                {'json://{"py/tuple": [[1]]}': 1, "b": 2},
+                dict[object, int],
+                {('json://{"py/tuple": [[1]]}',): "key ([1],) is unhashable"},
+            ),
+            (
                 {"x": 1, "y": 2},
                 dict[int, int],
                 {("x",): "cannot read 'x' as int", ("y",): "cannot read 'y' as int"},
@@ -2178,7 +2195,7 @@ class TestFastPath:
         resolved: list[object] = []
         monkeypatch.setattr(deserialize, "_resolve_alias", resolved.append)
 
-        assert from_plain(data, object) == expected
+        assert deserialize._python_from_plain(data, object) == expected
         assert resolved == []
 
     @pytest.mark.parametrize(("node", "reason"), _MALFORMED_NODES, ids=repr)
@@ -2440,6 +2457,35 @@ class TestScalars:
         with pytest.raises(ReadError, match=r"^cannot read .* as int$"):
             from_plain(raw, int, strict=False)
 
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "9007199254740993",
+            "-9007199254740993",
+            " 123456789012345678901234567890 ",
+            "1_000_000_000_000_000_001",
+        ],
+        ids=repr,
+    )
+    def test_lax_int_reads_integer_text_exactly(self, raw: str) -> None:
+        assert from_plain(raw, int, strict=False) == int(raw)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("1e3", 1000),
+            ("2.0", 2),
+            ("9007199254740993.0", 9007199254740993),
+            ("-9007199254740993e0", -9007199254740993),
+            ("1.5e30", 15 * 10**29),
+            # Integral only after rounding to a float: keeps the rounded value.
+            ("1.0000000000000000001", 1),
+        ],
+        ids=repr,
+    )
+    def test_lax_int_reads_integral_float_text(self, raw: str, expected: int) -> None:
+        assert from_plain(raw, int, strict=False) == expected
+
     @pytest.mark.parametrize("raw", [None, [1], {"a": 1}], ids=repr)
     def test_lax_int_refuses_a_non_number(self, raw: PlainTree) -> None:
         with pytest.raises(ReadError) as raised:
@@ -2520,6 +2566,32 @@ class TestForeignInput:
     def test_a_typed_leaf_of_the_wrong_type_raises(self) -> None:
         with pytest.raises(ReadError):
             from_plain(dt.datetime(2026, 1, 1, tzinfo=dt.UTC), int)
+
+    def test_a_tag_under_parts_built_on_each_read_still_decodes(self) -> None:
+        # Each read builds a new list, and dropping it frees its id for the next
+        # one. The tag scan must not mistake that list for one it already scanned.
+        data = cast(
+            "PlainTree",
+            [_FreshParts([{"py/tuple": [1, 2]}]), _FreshParts([1])],
+        )
+        assert from_plain(data, object) == [[[(1, 2)]], [[1]]]
+
+
+class _FreshParts(Sequence[object]):
+    """A sequence that returns a new one-item list each time an item is read."""
+
+    def __init__(self, items: list[object]) -> None:
+        self.items = items
+
+    @override
+    def __len__(self) -> int:
+        return len(self.items)
+
+    @override
+    def __getitem__(self, index: object) -> object:  # pyright: ignore[reportIncompatibleMethodOverride]  # ty: ignore[invalid-method-override]
+        if not isinstance(index, int) or index >= len(self.items):
+            raise IndexError(index)
+        return [self.items[index]]
 
 
 class TestLax:
@@ -2636,6 +2708,7 @@ class TestFieldTypes:
     def cold_cache(self) -> None:
         """Clear cached types, so each test computes the ones it checks."""
         deserialize._FIELD_TYPES.clear()
+        deserialize._PARTIAL_HINTS.clear()
 
     def test_a_dataclass_lists_fields_then_non_init_slots(self) -> None:
         assert dict(deserialize._field_types(Flagged)) == {"name": str, "_done": bool}
@@ -2657,6 +2730,23 @@ class TestFieldTypes:
         assert dict(first) == {"x": int, "y": float}
         assert deserialize._field_types(Point) is first
         assert deserialize._FIELD_TYPES[Point] is first
+
+    def test_a_nested_class_its_module_reaches_is_cached(self) -> None:
+        first = deserialize._field_types(Holder.Part)
+
+        assert dict(first) == {"x": int}
+        assert deserialize._field_types(Holder.Part) is first
+        assert deserialize._FIELD_TYPES[Holder.Part] is first
+
+    def test_a_nested_class_its_owner_does_not_name_is_not_cached(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        part = Holder.Part
+        monkeypatch.delattr(Holder, "Part")
+
+        assert dict(deserialize._field_types(part)) == {"x": int}
+        assert part not in deserialize._FIELD_TYPES
 
     @pytest.mark.parametrize(
         ("kind", "expected"),
@@ -2699,6 +2789,40 @@ class TestFieldTypes:
             "count": int,
         }
         assert HintedLater not in deserialize._FIELD_TYPES
+
+    def test_a_class_with_an_unresolved_hint_retries_only_that_hint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = dict(deserialize._field_types(HintedLater))
+        calls: list[object] = []
+
+        def counted(*args: object, **kwargs: object) -> object:
+            calls.append(args[0])
+            return get_type_hints(*args, **kwargs)  # pyright: ignore[reportArgumentType]  # ty: ignore[invalid-argument-type]
+
+        monkeypatch.setattr(deserialize, "get_type_hints", counted)
+
+        assert dict(deserialize._field_types(HintedLater)) == first
+        assert len(calls) == 1
+
+    def test_a_retry_survives_its_entry_being_dropped_meanwhile(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        first = dict(deserialize._field_types(HintedLater))
+        assert HintedLater in deserialize._PARTIAL_HINTS
+
+        # Stands in for another thread reading the same class between the
+        # entry's lookup and its removal.
+        def dropped_meanwhile(*args: object, **kwargs: object) -> bool:
+            del args, kwargs
+            deserialize._PARTIAL_HINTS.pop(HintedLater, None)
+            return True
+
+        monkeypatch.setattr(deserialize, "_resolves", dropped_meanwhile)
+
+        assert dict(deserialize._field_types(HintedLater)) == first
 
     def test_a_hint_that_resolves_later_reads_as_its_type(
         self,

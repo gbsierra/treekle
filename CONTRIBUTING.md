@@ -8,7 +8,11 @@ treekle accepts public changes through a generated public repository while the s
 
 ## Development setup
 
-Requires Python 3.12 and uv.
+Requires Python 3.12, uv, and a Rust toolchain (1.88 or newer) to build the
+compiled core in `rust/`. `TREEKLE_PURE_PYTHON=1` runs the pure-Python
+implementation instead. The native core does not build for free-threaded
+Python; the release's universal wheel installs the Python implementation
+without Rust.
 
 ```bash
 uv sync --all-groups
@@ -24,9 +28,13 @@ uv run ruff format --check --no-cache .
 uv run codespell .
 uv run ty check
 uv run basedpyright treekle
+cargo fmt --manifest-path rust/Cargo.toml --check
+PYO3_PYTHON="$PWD/.venv/bin/python" cargo clippy --manifest-path rust/Cargo.toml -- -D warnings
 uv run pytest
+TREEKLE_PURE_PYTHON=1 uv run pytest
 uv run python -c "import treekle"
 uv build
+uv run scripts/build_pure_wheel.py dist
 ```
 
 ## Public contribution flow

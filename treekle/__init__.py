@@ -38,7 +38,7 @@ tl;dr: No library is perfect, including this one.
 
                  treekle  pickle  jsonpickle  pydantic  msgspec  cattrs  mashumaro
 ---------------  -------  ------  ----------  --------  -------  ------  ---------
-C/Rust           ✗        ✓       ✗           ✓         ✓        ✗       ✗
+C/Rust           ✓        ✓       ✗           ✓         ✓        ✗       ✗
 stdlib           ✓        ✓       ✓           ✗         ✗        ✗       ✗
 plain            ✓        ✗       ✓           ✓         ✓        ✓       ✓
 typed result     ✓        ✗       ✗           ✓         ✓        ✓       ✓
@@ -70,9 +70,9 @@ GitHub stars     --       stdlib  1.3k        29.0k     4.2k     1.1k    940
 - shared refs: an object referenced twice decodes as one object; cycles too.
 - best-effort: bad input yields the partial value and every bad part's location.
 
-In our case being pure python is a bad thing; native implementations are
-faster and our preference would be to use msgspec. However we need pickle
-semantics but as raw text.
+Native implementations are faster, so treekle's core is Rust, with a
+pure-Python fallback. Our preference would otherwise be msgspec; however we
+need pickle semantics but as raw text.
 
 Each cell is what a probe of jsonpickle 4.1, pydantic 2.13, msgspec 0.22,
 cattrs 26.2, and mashumaro 3.23 returned:

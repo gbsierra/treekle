@@ -43,6 +43,8 @@ from zoneinfo import ZoneInfo
 
 import base64
 import json
+import os
+import warnings
 import weakref
 
 from treekle.plain import immutable
@@ -99,7 +101,8 @@ def to_plain(
 
     Args:
       obj: The value to convert; any object graph, shared references and cycles
-        included.
+        included, except a cycle inside a dict key. An object repeated inside a
+        dict key reads back as an equal copy, not the same object.
       dialect: The target format, which decides which values need a tag.
       mutable: Build dicts and lists when true; ``MappingProxyType`` and tuples
         when false.
@@ -113,7 +116,8 @@ def to_plain(
 
     Raises:
       ValueError: ``dialect`` names no known format.
-      TypeError: A leaf has no conversion and no hook.
+      TypeError: A leaf has no conversion and no hook, or a dict key holds a
+        cycle.
 
     """
     if dialect not in get_args(cast("object", Dialect.__value__)):
@@ -240,7 +244,16 @@ def _encode_node(value: object, state: _Encoding) -> object:
     if kind is float:
         return _encode_float(value, state)
     if id(value) in state.seen:
-        return _reference(state.seen[id(value)])
+        place = state.seen[id(value)]
+        reference = _reference(place)
+        if reference is not None:
+            return reference
+        # Inside a dict key, write a repeated value in full again. A key is a
+        # value, and a ``py/ref`` to a place inside a key cannot be read back.
+        if _encloses(place, state.here):
+            raise TypeError(
+                f"Cannot serialize a dict key holding a cycle through {value!r}.",
+            )
     if kind in state.hooks:
         return _encode_hooked(value, state)
     return _encoder_for(kind)(value, state)
@@ -292,14 +305,27 @@ def _push_values(node: dict[str, object], state: _Encoding) -> None:
         stack.append((item, node, key, here))
 
 
-def _reference(place: _Here) -> object:
-    """Return a ``py/ref`` naming ``place`` as the path of keys leading to it."""
+def _reference(place: _Here) -> dict[str, object] | None:
+    """Return a ``py/ref`` naming ``place``, or ``None`` if it is inside a key."""
     keys: list[str | int] = []
     while place is not None:
+        if place is _IN_KEY:
+            return None
         place, key = place
         keys.append(key)
     keys.reverse()
     return {"py/ref": keys}
+
+
+def _encloses(place: _Here, here: _Here) -> bool:
+    """Return whether ``place`` is ``here`` or one of its parents in the same key."""
+    while here is not None:
+        if here is place:
+            return True
+        if here is _IN_KEY:
+            return False
+        here = here[0]
+    return False
 
 
 def _encoder_for(kind: type) -> _Encoder:
@@ -336,8 +362,9 @@ def _register(value: object, state: _Encoding) -> None:
 
 def _rollback(state: _Encoding, mark: int) -> None:
     """Forget every number assigned since ``len(state.alive)`` was ``mark``."""
+    # A value repeated inside a dict key is registered once per copy.
     for value in state.alive[mark:]:
-        del state.seen[id(value)]
+        state.seen.pop(id(value), None)
     del state.alive[mark:]
 
 
@@ -465,11 +492,17 @@ def _encode_key(key: object, state: _Encoding) -> str:
     if _is_plain_key(key):
         return cast("str", key)
     # A key is text, so nothing inside it has a path a later ``py/ref`` can name.
-    mark = len(state.alive)
+    # A ``py/ref`` to one of its parts could not resolve either: the reader finds
+    # those parts under the key's own text, which is not known until the key is
+    # written. So the parts get places under ``_IN_KEY``, which ``_reference``
+    # never names. A ``py/ref`` to a value written before the key still works.
+    mark, here = len(state.alive), state.here
+    state.here = _IN_KEY
     try:
         encoded = _encode(key, state)
     finally:
         _rollback(state, mark)
+        state.here = here
     return "json://" + json.dumps(encoded)
 
 
@@ -644,6 +677,10 @@ def _verified_path(path: str, value: object) -> str:
 _NATIVE_LEAVES: Final = frozenset((str, int, bool))
 
 
+_IN_KEY: Final[_Here] = (None, "")
+"""Where an escaped key sits, as ``None`` is where the whole tree sits."""
+
+
 _CONCRETE_PATH: Final = type(Path())
 
 
@@ -674,3 +711,30 @@ _ENCODER_CACHE: Final[weakref.WeakKeyDictionary[type, _Encoder]] = (
 # be weakly referenced. Each entry keeps its object, so the ``id`` is never
 # reused while the entry stands.
 _IMPORT_PATHS: Final[dict[int, tuple[object, str]]] = {}
+
+
+_python_to_plain: Final = to_plain
+"""The Python walker, used when the optional Rust core is unavailable."""
+
+
+if os.environ.get("TREEKLE_PURE_PYTHON", "") in {"", "0"}:
+    try:
+        from treekle._rust import (
+            setup_encode as _setup_rust,
+            to_plain as _rust_to_plain,
+        )
+
+        _setup_rust(globals())
+    except ModuleNotFoundError:
+        pass
+    # A core built from other sources may lack this module's functions or fail
+    # to set up against it; Python must still serve rather than fail import.
+    except Exception as error:  # noqa: BLE001
+        warnings.warn(
+            f"treekle's Rust core does not match this treekle ({error}); "
+            "using the Python implementation until the core is rebuilt",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    else:
+        to_plain = _rust_to_plain  # ty: ignore[invalid-assignment]

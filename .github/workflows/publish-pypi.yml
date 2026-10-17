@@ -4,20 +4,124 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+  # Builds and checks every wheel on each pull request, so a platform's
+  # failure shows before a release; only the publish job is skipped.
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: publish-pypi-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  wheels:
+    name: Wheels ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.runner }}
+    # Bounded so a hung build fails in minutes, not at the 6h default.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - {name: linux-x86_64, runner: ubuntu-latest, target: x86_64, manylinux: auto}
+          # A native Arm runner, not cross-compilation, so its wheels can be run.
+          - {name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64, manylinux: auto}
+          - {name: macos-x86_64, runner: macos-15-intel, target: x86_64}
+          - {name: macos-arm64, runner: macos-latest, target: aarch64}
+          - {name: windows-x64, runner: windows-latest, target: x64}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: |
+            3.12
+            3.13
+            3.14
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          args: --release --out dist --interpreter 3.12 3.13 3.14
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      # The installer picks each interpreter's wheel from dist, as pip would
+      # from PyPI; a missing wheel fails instead of building from source.
+      - name: Check each wheel
+        shell: bash
+        run: |
+          for python in 3.12 3.13 3.14; do
+            uv run --isolated --no-project --no-index --no-build --find-links dist \
+              --python "$python" --with treekle \
+              python -P -W error scripts/check_wheel.py native
+          done
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.platform.name }}
+          path: dist
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-sdist
+          path: dist
+
+  pure-wheel:
+    name: Python-only fallback wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - name: Build and check fallback wheel
+        run: |
+          wheel=$(uv run scripts/build_pure_wheel.py dist)
+          uv run --isolated --no-project --with "$wheel" \
+            python -P -W error scripts/check_wheel.py python
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-pure-wheel
+          path: dist
+
   publish:
-    name: Build and publish package to PyPI
+    name: Publish package to PyPI
+    needs: [wheels, sdist, pure-wheel]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # Bounded so a hung publish fails in minutes, not at the 6h default.
     timeout-minutes: 20
     environment: pypi
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -25,12 +129,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
-      - name: Build package
-        run: uv build --out-dir dist
-
-      - name: Validate built package
+      # Each build job already installed and ran what it uploads.
+      - name: Check package metadata
         run: |
-          uv run python -c "import treekle; print(treekle.__file__)"
+          ls dist
+          uv run --isolated --no-project --with twine twine check --strict dist/*
 
       - name: Publish package
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
