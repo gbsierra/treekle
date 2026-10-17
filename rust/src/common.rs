@@ -370,6 +370,25 @@ pub fn is_callable(obj: &B<'_>) -> bool {
     unsafe { ffi::PyCallable_Check(obj.as_ptr()) != 0 }
 }
 
+// A libpython slot function is recognized by the address CPython stores in a
+// builtin type's slot, not by naming the function. pyo3-ffi links libpython's
+// functions without ``dllimport``, so on Windows a name resolves to this
+// module's import stub, which no slot ever holds. Type objects are linked as
+// data, so their slots hold the real addresses on every platform.
+
+/// ``PyObject_HashNotImplemented``, which marks a class unhashable: ``list``
+/// has it, as every class with ``__hash__ = None`` does.
+#[inline(always)]
+pub fn hash_not_implemented() -> Option<usize> {
+    unsafe { ffi::PyList_Type.tp_hash }.map(|f| f as usize)
+}
+
+/// ``PyObject_GenericGetAttr``, ``object``'s own attribute lookup.
+#[inline(always)]
+pub fn generic_getattr_slot() -> Option<usize> {
+    unsafe { ffi::PyBaseObject_Type.tp_getattro }.map(|f| f as usize)
+}
+
 /// ``type(obj).__hash__ is None``: whether instances of ``obj``'s class opt
 /// out of hashing.
 #[inline]
@@ -380,12 +399,7 @@ pub fn is_unhashable(obj: &B<'_>) -> PyResult<bool> {
     // metaclass may answer the lookup itself (a ``__getattribute__``, a
     // ``__hash__`` property) while the slot still hashes.
     if unsafe { ffi::Py_TYPE(kind.cast()) } == &raw mut ffi::PyType_Type {
-        // Slot functions are compared by address; libpython exports have one canonical address.
-        return Ok(unsafe {
-            (*kind).tp_hash.is_some_and(|f| {
-                f as usize == ffi::PyObject_HashNotImplemented as *const () as usize
-            })
-        });
+        return Ok(unsafe { (*kind).tp_hash }.map(|f| f as usize) == hash_not_implemented());
     }
     let py = obj.py();
     Ok(obj

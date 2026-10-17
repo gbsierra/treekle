@@ -425,11 +425,7 @@ const PY_AUDIT_READ: std::ffi::c_int = 2;
 
 #[inline]
 fn generic_getattr(kind: *mut ffi::PyTypeObject) -> bool {
-    unsafe {
-        (*kind)
-            .tp_getattro
-            .is_some_and(|f| f as usize == ffi::PyObject_GenericGetAttr as *const () as usize)
-    }
+    unsafe { (*kind).tp_getattro }.map(|f| f as usize) == generic_getattr_slot()
 }
 
 /// Where ``kind``'s instances hold slot ``name``, if generic attribute lookup
