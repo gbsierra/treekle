@@ -119,6 +119,10 @@ pub struct DecGlobals {
     is_typeddict: Py<PyAny>,
     is_dataclass: Py<PyAny>,
     fields: Py<PyAny>,
+    /// ``dataclasses._FIELD``, while ``fields`` is ``dataclasses.fields``, so
+    /// ``fields`` can be read natively.
+    field_kind: Option<Py<PyAny>>,
+    field_layout: Option<FieldLayout>,
     missing: Py<PyAny>,
     json_loads: Py<PyAny>,
     json_error: Py<PyAny>,
@@ -152,6 +156,89 @@ pub struct DecGlobals {
 /// Shared, so a call keeps the globals it started with even if a hook reloads
 /// ``treekle.deserialize`` and so replaces them.
 static DEC: GilCell<Option<Rc<DecGlobals>>> = GilCell::new(None);
+
+/// The ``dataclasses.Field`` attributes the decoder reads.
+#[derive(Clone, Copy)]
+enum FieldSlot {
+    Name,
+    Default,
+    DefaultFactory,
+    Init,
+    Kind,
+}
+
+const FIELD_SLOTS: [FieldSlot; 5] = [
+    FieldSlot::Name,
+    FieldSlot::Default,
+    FieldSlot::DefaultFactory,
+    FieldSlot::Init,
+    FieldSlot::Kind,
+];
+
+impl FieldSlot {
+    fn name<'py>(self, py: Python<'py>) -> &'py Bound<'py, PyString> {
+        match self {
+            Self::Name => pyo3::intern!(py, "name"),
+            Self::Default => pyo3::intern!(py, "default"),
+            Self::DefaultFactory => pyo3::intern!(py, "default_factory"),
+            Self::Init => pyo3::intern!(py, "init"),
+            Self::Kind => pyo3::intern!(py, "_field_type"),
+        }
+    }
+}
+
+/// Where ``dataclasses.Field`` instances hold each attribute the decoder
+/// reads, for a ``Field`` whose class is exactly ``kind``. An offset is kept
+/// only for a plain object member that generic lookup would read directly.
+struct FieldLayout {
+    kind: Py<PyAny>,
+    /// ``Field``'s state when the offsets were read; they serve only while
+    /// it holds, so a ``Field`` class changed later is read by ``getattr``.
+    stamp: Stamp,
+    offsets: [Option<isize>; 5],
+}
+
+fn field_layout(kind: &B<'_>) -> Option<FieldLayout> {
+    let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
+    // A class whose attribute lookup is not ``object``'s could answer
+    // ``getattr`` without its slots; and an immutable type cannot change them.
+    let generic = unsafe { (*class).tp_getattro }.map(|f| f as usize) == generic_getattr_slot();
+    if !generic {
+        return None;
+    }
+    let py = kind.py();
+    let stamp = Stamp::always(kind);
+    let offsets = FIELD_SLOTS.map(|slot| member_offset(class, slot.name(py)));
+    Some(FieldLayout {
+        kind: kind.clone().unbind(),
+        stamp,
+        offsets,
+    })
+}
+
+unsafe extern "C" {
+    fn _PyType_Lookup(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject)
+    -> *mut ffi::PyObject;
+}
+
+fn member_offset(class: *mut ffi::PyTypeObject, name: &Bound<'_, PyString>) -> Option<isize> {
+    const PY_AUDIT_READ: std::ffi::c_int = 2;
+    unsafe {
+        let found = _PyType_Lookup(class, name.as_ptr());
+        if found.is_null() || ffi::Py_TYPE(found) != &raw mut ffi::PyMemberDescr_Type {
+            return None;
+        }
+        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
+        if ffi::PyType_IsSubtype(class, (*descriptor).d_common.d_type) == 0 {
+            return None;
+        }
+        let member = (*descriptor).d_member.cast::<ffi::PyMemberDef>();
+        if (*member).type_code != ffi::Py_T_OBJECT_EX || (*member).flags & PY_AUDIT_READ != 0 {
+            return None;
+        }
+        Some((*member).offset)
+    }
+}
 
 fn item<'py>(module: &Bound<'py, PyDict>, name: &str) -> PyResult<B<'py>> {
     module
@@ -202,6 +289,12 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
     .into_iter()
     .map(|(tag, name)| Ok((tag, get(name)?)))
     .collect::<PyResult<Vec<_>>>()?;
+    let dataclasses = py.import("dataclasses")?;
+    let field_kind = if item(module, "fields")?.is(dataclasses.getattr("fields")?) {
+        dataclasses.getattr("_FIELD").ok().map(Bound::unbind)
+    } else {
+        None
+    };
     let shown = item(module, "_SHOWN")?;
     let mut shown_limit = usize::MAX;
     for name in ["maxstring", "maxlong", "maxother"] {
@@ -229,6 +322,8 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         is_typeddict: get("is_typeddict")?,
         is_dataclass: get("is_dataclass")?,
         fields: get("fields")?,
+        field_layout: field_layout(&dataclasses.getattr("Field")?),
+        field_kind,
         missing: get("MISSING")?,
         json_loads: json.getattr("loads")?.unbind(),
         json_error: json.getattr("JSONDecodeError")?.unbind(),
@@ -285,9 +380,32 @@ struct UnionInfo {
 
 struct DcInfo {
     index: Py<PyDict>,
+    /// Each field's name as UTF-8, in ``index``'s order, when every name is
+    /// an exact str: then an exact str key matches a name exactly when its
+    /// bytes do, as the index dict's own lookup would find.
+    names: Option<Vec<Box<[u8]>>>,
     targets: Vec<Py<PyAny>>,
     plans: Vec<RefCell<Option<Rc<Plan>>>>,
     persistent: bool,
+}
+
+impl DcInfo {
+    /// The slot of the field named ``key``, searched from ``cursor``, which
+    /// moves past the match: records list fields in order, so each key is
+    /// usually found at the first slot tried. ``None`` where no field has
+    /// that name, or names are not all exact strs (the dict decides then).
+    fn slot_of(&self, key: &[u8], cursor: &mut usize) -> Option<usize> {
+        let names = self.names.as_ref()?;
+        let count = names.len();
+        for step in 0..count {
+            let slot = (*cursor + step) % count;
+            if *names[slot] == *key {
+                *cursor = slot + 1;
+                return Some(slot);
+            }
+        }
+        None
+    }
 }
 
 struct Plan {
@@ -376,9 +494,14 @@ struct Judging<'py> {
 // ------------------------------------------------------------------ frames --
 
 /// ``_start``'s answer: a value read at once, or a frame that reads its parts.
+///
+/// Frames are boxed from where they start to where they finish. A ``Frame``
+/// is ~180 bytes, and passing it by value through ``Start``, the walk's
+/// stack, and ``finished`` copied it at each hop; that copying cost a tenth
+/// of decoding a list of dataclasses.
 enum Start<'py> {
     Value(B<'py>),
-    Frame(Frame<'py>),
+    Frame(Box<Frame<'py>>),
 }
 
 // Python's parent keeps the part it handed out (``pending_raw``, ``pending_at``)
@@ -505,8 +628,8 @@ enum Body<'py> {
 }
 
 impl<'py> Frame<'py> {
-    fn new(at: u32, raw: &B<'py>, body: Body<'py>) -> Self {
-        Self {
+    fn new(at: u32, raw: &B<'py>, body: Body<'py>) -> Box<Self> {
+        Box::new(Self {
             at,
             place: at,
             raw: raw.clone(),
@@ -514,7 +637,7 @@ impl<'py> Frame<'py> {
             then: None,
             reading: None,
             body,
-        }
+        })
     }
 
     fn failed(self) -> Failed<'py> {
@@ -1182,15 +1305,24 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let types = self.b(&g.field_types).call1((target,))?;
         let index = PyDict::new(py);
         let mut targets = Vec::new();
+        let mut names = Some(Vec::new());
         let mut items = MapItems::new(&types)?;
         while let Some((name, hint)) = items.next_item()? {
             index.set_item(&name, targets.len())?;
             targets.push(hint.unbind());
+            names = names.and_then(|mut names| {
+                let text = (tp(&name) == t_str()).then(|| utf8(&name)).flatten()?;
+                names.push(Box::<[u8]>::from(text));
+                Some(names)
+            });
         }
+        // A repeated name keeps only its last slot in ``index``.
+        let names = names.filter(|names| names.len() == index.len());
         let persistent = self.b(&g.field_types_cache).contains(target)?;
         let plans = (0..targets.len()).map(|_| RefCell::new(None)).collect();
         let info = Rc::new(DcInfo {
             index: index.unbind(),
+            names,
             targets,
             plans,
             persistent,
@@ -1310,7 +1442,9 @@ impl<'py, 'g> Decoder<'py, 'g> {
     }
 
     /// ``_finished``: a frame's container built, then converted and checked.
-    fn finished(&mut self, frame: Frame<'py>) -> (Failed<'py>, DR<B<'py>>) {
+    // Boxed on purpose; see ``Start``.
+    #[allow(clippy::boxed_local)]
+    fn finished(&mut self, frame: Box<Frame<'py>>) -> (Failed<'py>, DR<B<'py>>) {
         let Frame {
             at,
             place,
@@ -1319,7 +1453,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             then,
             reading,
             body,
-        } = frame;
+        } = *frame;
         let result = match self.finish(at, body) {
             Ok(value) => self.checked(value, then, check),
             Err(error) => Err(error),
@@ -1361,9 +1495,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
 
     /// ``_unwind``: a failed frame's error handed to the nearest frame below
     /// that recovers, else returned.
+    // Boxed on purpose; see ``Start``.
+    #[allow(clippy::vec_box)]
     fn unwind(
         &mut self,
-        stack: &mut Vec<Frame<'py>>,
+        stack: &mut Vec<Box<Frame<'py>>>,
         mut failed: Failed<'py>,
         mut error: DErr,
     ) -> DR<()> {
@@ -1659,7 +1795,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
     // ------------------------------------------------------------- frames --
 
     /// ``_Frame.step``: parts read until one needs a frame of its own.
-    fn step(&mut self, frame: &mut Frame<'py>) -> DR<Option<Frame<'py>>> {
+    fn step(&mut self, frame: &mut Frame<'py>) -> DR<Option<Box<Frame<'py>>>> {
         let py = self.py;
         let at = frame.at;
         match &mut frame.body {
@@ -1838,7 +1974,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         }
     }
 
-    fn step_reduce(&mut self, frame: &mut Frame<'py>) -> DR<Option<Frame<'py>>> {
+    fn step_reduce(&mut self, frame: &mut Frame<'py>) -> DR<Option<Box<Frame<'py>>>> {
         let at = frame.at;
         loop {
             let Body::Reduce {
@@ -1885,7 +2021,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         py_eq(raw, expected.as_any())
     }
 
-    fn step_union(&mut self, frame: &mut Frame<'py>) -> DR<Option<Frame<'py>>> {
+    fn step_union(&mut self, frame: &mut Frame<'py>) -> DR<Option<Box<Frame<'py>>>> {
         let at = frame.at;
         loop {
             let Body::Union {
@@ -2151,6 +2287,38 @@ impl<'py, 'g> Decoder<'py, 'g> {
 
     /// ``_tag_of``: the highest-precedence tag on a mapping, if any.
     fn tag_of(&self, data: &B<'py>) -> DR<Option<Tag>> {
+        // An exact dict of exact str keys answers in one pass: no key's
+        // ``__eq__`` or ``__hash__`` is Python code, so membership is bytes.
+        if tp(data) == t_dict() {
+            let mut best: Option<usize> = None;
+            let mut tagged = false;
+            let mut exact = true;
+            let mut position: ffi::Py_ssize_t = 0;
+            let mut key = std::ptr::null_mut();
+            let mut value = std::ptr::null_mut();
+            while unsafe { ffi::PyDict_Next(data.as_ptr(), &mut position, &mut key, &mut value) }
+                != 0
+            {
+                let key = unsafe { Bound::from_borrowed_ptr(self.py, key) };
+                let Some(text) = (tp(&key) == t_str()).then(|| utf8(&key)).flatten() else {
+                    exact = false;
+                    break;
+                };
+                if text.starts_with(b"py/") {
+                    tagged = true;
+                    if let Some(rank) = TAGS.iter().position(|(name, _)| name.as_bytes() == text) {
+                        best = Some(best.map_or(rank, |seen| seen.min(rank)));
+                    }
+                }
+            }
+            if exact {
+                return match (tagged, best) {
+                    (false, _) => Ok(None),
+                    (true, Some(rank)) => Ok(Some(TAGS[rank].1)),
+                    (true, None) => self.unknown_tag(data),
+                };
+            }
+        }
         if !self.has_tag_key(data)? {
             return Ok(None);
         }
@@ -2165,6 +2333,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 return Ok(Some(*tag));
             }
         }
+        self.unknown_tag(data)
+    }
+
+    /// ``_tag_of``'s refusal of a node whose ``py/`` keys name no tag.
+    fn unknown_tag(&self, data: &B<'py>) -> DR<Option<Tag>> {
         let names = PyList::empty(self.py);
         for key in data.try_iter()? {
             names.append(key?.str()?)?;
@@ -2307,13 +2480,42 @@ impl<'py, 'g> Decoder<'py, 'g> {
                     Some(origin) => origin.bind(py).clone(),
                     None => target.clone(),
                 };
-                if !value.is_instance(&origin)? {
+                if !self.is_instance(value, &origin)? {
                     return Ok(Shallow::Verdict(false));
                 }
                 return self.item_parts(value, plan);
             }
         };
         Ok(Shallow::Verdict(fit))
+    }
+
+    /// ``isinstance(value, origin)``.
+    ///
+    /// ``isinstance`` asks ``type(origin).__instancecheck__``; ``type``'s own
+    /// answers true at once when ``type(value)`` subclasses ``origin``, and
+    /// only otherwise reads ``value.__class__``, which can run Python code.
+    /// Under a metaclass that inherits ``type``'s check, that first answer is
+    /// decided by the MRO here.
+    fn is_instance(&self, value: &B<'py>, origin: &B<'py>) -> PyResult<bool> {
+        if is_class(origin) {
+            let meta = unsafe { ffi::Py_TYPE(origin.as_ptr()) };
+            let check = unsafe {
+                _PyType_Lookup(meta, pyo3::intern!(self.py, "__instancecheck__").as_ptr())
+            };
+            let own = unsafe {
+                _PyType_Lookup(
+                    &raw mut ffi::PyType_Type,
+                    pyo3::intern!(self.py, "__instancecheck__").as_ptr(),
+                )
+            };
+            if !check.is_null()
+                && check == own
+                && unsafe { ffi::PyType_IsSubtype(tp(value), origin.as_ptr().cast()) } != 0
+            {
+                return Ok(true);
+            }
+        }
+        value.is_instance(origin)
     }
 
     /// A container's items against its element types, as ``_shallow_fit`` queues them.
@@ -3003,9 +3205,20 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let mut unknown = Vec::new();
         let mut items = MapItems::new(&data)?;
         let mut entries = Vec::new();
+        // An exact str key matches a field by its bytes, which is what the
+        // index dict's lookup decides for it, and records list fields in
+        // declared order, so the search starts after the last match.
+        let mut cursor = 0;
         while let Some((key, raw)) = items.next_item()? {
-            match index.get_item(&key)? {
-                Some(slot) => entries.push((key, raw, slot.extract::<usize>()?)),
+            let slot = match (tp(&key) == t_str()).then(|| utf8(&key)).flatten() {
+                Some(text) => info.slot_of(text, &mut cursor),
+                None => index
+                    .get_item(&key)?
+                    .map(|slot| slot.extract::<usize>())
+                    .transpose()?,
+            };
+            match slot {
+                Some(slot) => entries.push((key, raw, slot)),
                 None => unknown.push(key),
             }
         }
@@ -3075,15 +3288,39 @@ impl<'py, 'g> Decoder<'py, 'g> {
         } else {
             let kwargs = PyDict::new(py);
             let mut rest = Vec::new();
-            let init = PySet::empty(py)?;
-            for field in self.b(&self.g.fields).call1((target,))?.try_iter()? {
-                let field = field?;
-                if field.getattr(pyo3::intern!(py, "init"))?.is_truthy()? {
-                    init.add(field.getattr(pyo3::intern!(py, "name"))?)?;
+            let mut init = Vec::new();
+            for field in self.dataclass_fields(target)? {
+                if self.field_slot(&field, FieldSlot::Init)?.is_truthy()? {
+                    init.push(self.field_slot(&field, FieldSlot::Name)?);
                 }
             }
+            // With exact str keys and names, membership is a byte comparison
+            // and runs no ``__eq__``; any other key asks the set Python builds.
+            let exact = init
+                .iter()
+                .all(|name| tp(name) == t_str() && utf8(name).is_some());
+            let set = if exact {
+                None
+            } else {
+                let set = PySet::empty(py)?;
+                for name in &init {
+                    set.add(name)?;
+                }
+                Some(set)
+            };
             for (key, member, _) in members {
-                if init.contains(&key)? {
+                let inside = match &set {
+                    Some(set) => set.contains(&key)?,
+                    None if tp(&key) == t_str() && utf8(&key).is_some() => {
+                        let text = utf8(&key);
+                        init.iter().any(|name| name.is(&key) || utf8(name) == text)
+                    }
+                    None => {
+                        let set = PySet::new(py, &init)?;
+                        set.contains(&key)?
+                    }
+                };
+                if inside {
                     kwargs.set_item(key, member)?;
                 } else {
                     rest.push((key, member));
@@ -3112,12 +3349,106 @@ impl<'py, 'g> Decoder<'py, 'g> {
         Ok(value)
     }
 
+    /// ``fields(target)``, read natively while ``fields`` is ``dataclasses``' own:
+    /// the values of ``__dataclass_fields__`` whose ``_field_type`` is ``_FIELD``.
+    fn dataclass_fields(&self, target: &B<'py>) -> PyResult<Vec<B<'py>>> {
+        let py = self.py;
+        let Some(field_kind) = &self.g.field_kind else {
+            return self
+                .b(&self.g.fields)
+                .call1((target,))?
+                .try_iter()?
+                .collect();
+        };
+        let declared = match target.getattr(pyo3::intern!(py, "__dataclass_fields__")) {
+            Ok(declared) => declared,
+            Err(error) if error.is_instance_of::<PyAttributeError>(py) => {
+                return Err(PyTypeError::new_err(
+                    "must be called with a dataclass type or instance",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        // ``fields`` iterates ``.values()``; an exact dict yields them in the
+        // order ``PyDict_Next`` does, and reading it runs no Python code.
+        if tp(&declared) == t_dict() {
+            let mut found = Vec::new();
+            for (_, field) in dict_entries(unsafe { declared.cast_unchecked::<PyDict>() }) {
+                if self
+                    .field_slot(&field, FieldSlot::Kind)?
+                    .is(field_kind.bind(py))
+                {
+                    found.push(field);
+                }
+            }
+            return Ok(found);
+        }
+        let values = declared.call_method0(pyo3::intern!(py, "values"))?;
+        let mut found = Vec::new();
+        for field in values.try_iter()? {
+            let field = field?;
+            if self
+                .field_slot(&field, FieldSlot::Kind)?
+                .is(field_kind.bind(py))
+            {
+                found.push(field);
+            }
+        }
+        Ok(found)
+    }
+
+    /// ``field.<name>`` for a ``dataclasses.Field``, read from its slot when
+    /// the field is exactly that class, else by ``getattr``.
+    fn field_slot(&self, field: &B<'py>, slot: FieldSlot) -> PyResult<B<'py>> {
+        let py = self.py;
+        if let Some(layout) = &self.g.field_layout
+            && tp(field) == layout.kind.bind(py).as_ptr().cast()
+            && layout.stamp.holds(layout.kind.bind(py))
+            && let Some(offset) = layout.offsets[slot as usize]
+        {
+            let read = unsafe {
+                *field
+                    .as_ptr()
+                    .cast::<u8>()
+                    .offset(offset)
+                    .cast::<*mut ffi::PyObject>()
+            };
+            if !read.is_null() {
+                return Ok(unsafe { Bound::from_borrowed_ptr(py, read) });
+            }
+        }
+        field.getattr(slot.name(py))
+    }
+
     fn with_defaults(
         &self,
         members: Vec<(B<'py>, B<'py>, usize)>,
         target: &B<'py>,
     ) -> DR<Vec<(B<'py>, B<'py>)>> {
         let py = self.py;
+        let declared = self.dataclass_fields(target)?;
+        let mut names = Vec::with_capacity(declared.len());
+        for field in &declared {
+            names.push(self.field_slot(field, FieldSlot::Name)?);
+        }
+        // A record carrying every field, each key an exact str equal to its
+        // field's name by identity or by bytes, needs no default: comparing
+        // such strs runs no Python code, so the set Python builds is skipped.
+        let exact = |key: &B<'py>| tp(key) == t_str();
+        if members.len() >= names.len()
+            && names.iter().all(exact)
+            && members.iter().all(|(key, _, _)| exact(key))
+            && names.iter().all(|name| {
+                members.iter().any(|(key, _, _)| {
+                    key.is(name) || (utf8(key).is_some() && utf8(key) == utf8(name))
+                })
+            })
+        {
+            return Ok(members
+                .into_iter()
+                .map(|(key, member, _)| (key, member))
+                .collect());
+        }
         let present = PySet::empty(py)?;
         let mut filled = Vec::with_capacity(members.len());
         for (key, member, _) in members {
@@ -3125,19 +3456,17 @@ impl<'py, 'g> Decoder<'py, 'g> {
             filled.push((key, member));
         }
         let mut missing = Vec::new();
-        for field in self.b(&self.g.fields).call1((target,))?.try_iter()? {
-            let field = field?;
-            let name = field.getattr(pyo3::intern!(py, "name"))?;
+        for (field, name) in declared.iter().zip(names) {
             if present.contains(&name)? {
                 continue;
             }
-            let default = field.getattr(pyo3::intern!(py, "default"))?;
-            let factory = field.getattr(pyo3::intern!(py, "default_factory"))?;
+            let default = self.field_slot(field, FieldSlot::Default)?;
+            let factory = self.field_slot(field, FieldSlot::DefaultFactory)?;
             if !default.is(self.b(&self.g.missing)) {
                 filled.push((name, default));
             } else if !factory.is(self.b(&self.g.missing)) {
                 filled.push((name, factory.call0()?));
-            } else if field.getattr(pyo3::intern!(py, "init"))?.is_truthy()? {
+            } else if self.field_slot(field, FieldSlot::Init)?.is_truthy()? {
                 missing.push(name);
             }
         }

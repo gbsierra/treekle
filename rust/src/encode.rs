@@ -268,6 +268,8 @@ unsafe extern "C" {
     -> *mut ffi::PyObject;
     fn PyObject_GenericGetDict(obj: *mut ffi::PyObject, context: *mut c_void)
     -> *mut ffi::PyObject;
+    /// A dict sized for ``minused`` entries, so filling it never resizes.
+    fn _PyDict_NewPresized(minused: ffi::Py_ssize_t) -> *mut ffi::PyObject;
 }
 
 /// What the walk reads from ``treekle.serialize`` and ``treekle.reflect``,
@@ -408,6 +410,15 @@ struct ClassInfo {
     layouts: [Option<Rc<Layout>>; 2],
     /// Whether it reduces as ``Enum.__reduce_ex__`` does, read natively.
     enum_member: Option<bool>,
+    /// The ``__dict__`` keys of the last instance read, by identity, and the
+    /// order sorting gave them; instances of one class usually share both.
+    dict_order: Option<DictOrder>,
+}
+
+/// The keys one instance's ``__dict__`` held, and the order they sort in.
+struct DictOrder {
+    keys: Vec<Py<PyAny>>,
+    sorted: Vec<usize>,
 }
 
 /// A class's slots, as ``attribute_names`` names them, and where each lives.
@@ -677,8 +688,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
             sort,
             frames,
             stack: Vec::with_capacity(64),
-            seen: HashMap::new(),
-            alive: Vec::new(),
+            seen: HashMap::with_capacity(64),
+            alive: Vec::with_capacity(64),
             env,
             generation,
             classes,
@@ -829,6 +840,53 @@ impl<'py, 'g> Encoder<'py, 'g> {
         Ok(())
     }
 
+    /// A dict holding ``entries``, its values not yet plain queued as
+    /// ``_push_values`` queues them: what building the dict then pushing
+    /// its values does, without reading the dict back.
+    ///
+    /// Every key is an exact str, whose hash and ``==`` run no Python code,
+    /// so the dict ends with one entry per key in first-seen order holding
+    /// the last value set; and its iteration order is that order.
+    fn node_from(
+        &mut self,
+        lead: Option<(&Bound<'py, PyString>, B<'py>)>,
+        entries: Vec<(B<'py>, B<'py>)>,
+        parent: u32,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let py = self.py;
+        let size = entries.len() + usize::from(lead.is_some());
+        let node = unsafe {
+            Bound::from_owned_ptr_or_err(py, _PyDict_NewPresized(size as ffi::Py_ssize_t))?
+                .cast_into_unchecked::<PyDict>()
+        };
+        if let Some((tag, value)) = lead {
+            node.set_item(tag, value)?;
+        }
+        for (key, value) in &entries {
+            node.set_item(key, value)?;
+        }
+        if node.len() != size {
+            // A repeated key leaves the dict holding fewer entries than were
+            // set, in an order only the dict knows.
+            self.push_values(&node, parent);
+            return Ok(node);
+        }
+        let shared = node.clone().into_any();
+        for (key, item) in entries.into_iter().rev() {
+            if self.is_plain(&item) {
+                continue;
+            }
+            self.stack.push(Entry::Part {
+                value: item,
+                node: shared.clone(),
+                slot: Slot::Key(key),
+                raw: false,
+                parent,
+            });
+        }
+        Ok(node)
+    }
+
     /// ``_push_values``: queue each value of ``node`` not yet plain, the first last.
     fn push_values(&mut self, node: &Bound<'py, PyDict>, parent: u32) {
         for (key, item) in dict_entries(node).into_iter().rev() {
@@ -962,6 +1020,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 path: None,
                 layouts: [None, None],
                 enum_member: None,
+                dict_order: None,
             };
             let stale = self.classes.insert(key, info);
             drop(stale);
@@ -1450,14 +1509,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
             (plain, entries)
         };
-        let node = PyDict::new(py);
         if plain {
-            for (key, item) in &entries {
-                node.set_item(key, item)?;
-            }
-            self.push_values(&node, frame);
-            return Ok(node.into_any());
+            // A plain key is an exact str, as ``node_from`` needs.
+            return Ok(self.node_from(None, entries, frame)?.into_any());
         }
+        let node = PyDict::new(py);
         // An escaped key is encoded when its entry is reached, after every
         // earlier value, so a key naming an object written earlier becomes a
         // ``py/ref``. Every entry waits its turn, plain ones too, to keep the
@@ -1505,9 +1561,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let py = self.py;
         self.register(value, frame);
         let path = self.class_path(kind)?;
+        let members = self.object_members(value, kind)?;
+        // A member named ``py/object`` overwrites the tag in place, which
+        // ``node_from`` cannot tell from a repeat; leave that to the dict.
+        if members.iter().all(|(name, _)| tp(name) == t_str()) {
+            let node = self.node_from(Some((intern!(py, "py/object"), path)), members, frame)?;
+            return Ok(node.into_any());
+        }
         let node = PyDict::new(py);
         node.set_item(intern!(py, "py/object"), path)?;
-        for (name, member) in self.object_members(value, kind)? {
+        for (name, member) in members {
             node.set_item(name, member)?;
         }
         self.push_values(&node, frame);
@@ -1542,7 +1605,14 @@ impl<'py, 'g> Encoder<'py, 'g> {
         // keys that are not slots, after the slots, sorted together if asked.
         let names = layout.names.bind(py);
         let mut extra = Vec::new();
-        if let Some(state) = optional_attr(value, intern!(py, "__dict__").as_any())?
+        let state = optional_attr(value, intern!(py, "__dict__").as_any())?;
+        if layout.slots.is_empty()
+            && let Some(state) = &state
+            && let Some(members) = self.dict_members(value, kind, state, sort)?
+        {
+            return Ok(members);
+        }
+        if let Some(state) = state
             && state.is_truthy()?
         {
             for key in state.try_iter()? {
@@ -1582,6 +1652,111 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
         }
         Ok(members)
+    }
+
+    /// The members of a slotless object read straight from its ``__dict__``,
+    /// or ``None`` where ``getattr`` might answer otherwise.
+    ///
+    /// ``getattr`` returns the instance dict's entry unless the class has a
+    /// data descriptor of that name, or its lookup is not ``object``'s; and
+    /// only when ``__dict__`` is the dict that lookup reads. With exact str
+    /// keys no Python code runs, so the dict cannot change while it is read.
+    fn dict_members(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        state: &B<'py>,
+        sort: bool,
+    ) -> PyResult<Option<Vec<(B<'py>, B<'py>)>>> {
+        let py = self.py;
+        let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
+        if tp(state) != t_dict() || !generic_getattr(class) {
+            return Ok(None);
+        }
+        let generic = unsafe {
+            Bound::from_owned_ptr_or_opt(
+                py,
+                PyObject_GenericGetDict(value.as_ptr(), std::ptr::null_mut()),
+            )
+        };
+        match generic {
+            Some(generic) if generic.is(state) => {}
+            Some(_) => return Ok(None),
+            None => {
+                unsafe { ffi::PyErr_Clear() };
+                return Ok(None);
+            }
+        }
+        let entries = dict_entries(unsafe { state.cast_unchecked::<PyDict>() });
+        // The order and the descriptor check are kept per class only while the
+        // class is unchanged, so its keys need no fresh lookup.
+        let now = self.current()?;
+        let known = self
+            .known(kind, now)
+            .and_then(|info| info.dict_order.as_ref());
+        if let Some(order) = known
+            && order.keys.len() == entries.len()
+            && order
+                .keys
+                .iter()
+                .zip(&entries)
+                .all(|(key, (each, _))| key.as_ptr() == each.as_ptr())
+        {
+            let pending = self.b(&self.g.pending);
+            let mut members = Vec::with_capacity(entries.len());
+            let pick = |index: usize| entries[index].clone();
+            if sort {
+                for &index in &order.sorted {
+                    let (key, member) = pick(index);
+                    if !member.is(pending) {
+                        members.push((key, member));
+                    }
+                }
+            } else {
+                for index in 0..entries.len() {
+                    let (key, member) = pick(index);
+                    if !member.is(pending) {
+                        members.push((key, member));
+                    }
+                }
+            }
+            return Ok(Some(members));
+        }
+        let before = Stamp::always(kind);
+        let mut keyed = Vec::with_capacity(entries.len());
+        for (index, (key, _)) in entries.iter().enumerate() {
+            if tp(key) != t_str() {
+                return Ok(None);
+            }
+            let found = unsafe { _PyType_Lookup(class, key.as_ptr()) };
+            if !found.is_null() && unsafe { (*ffi::Py_TYPE(found)).tp_descr_set.is_some() } {
+                return Ok(None);
+            }
+            keyed.push(([key.clone()], index));
+        }
+        let sorted = sorted_by_keys(py, keyed)?;
+        let order = DictOrder {
+            keys: entries
+                .iter()
+                .map(|(key, _)| key.clone().unbind())
+                .collect(),
+            sorted: sorted.clone(),
+        };
+        let pending = self.b(&self.g.pending).clone();
+        let indices: Vec<usize> = if sort {
+            sorted
+        } else {
+            (0..entries.len()).collect()
+        };
+        let members = indices
+            .into_iter()
+            .map(|index| entries[index].clone())
+            .filter(|(_, member)| !member.is(&pending))
+            .collect();
+        if let Some(info) = self.keep(kind, now, &before) {
+            info.dict_order = Some(order);
+        }
+        Ok(Some(members))
     }
 
     /// ``getattr(value, name, PENDING)`` unless that is ``PENDING``, read

@@ -408,9 +408,37 @@ pub fn is_unhashable(obj: &B<'_>) -> PyResult<bool> {
         .is_none())
 }
 
+/// ``PyUnicode_IS_COMPACT_ASCII``, which pyo3 does not expose on 3.14.
+///
+/// With the GIL (the only build this module compiles for), 3.12 to 3.14 lay
+/// out ``PyASCIIObject.state`` as one ``unsigned int`` after ``length`` and
+/// ``hash``: ``interned:2, kind:3, compact:1, ascii:1``, low bit first.
+#[inline(always)]
+unsafe fn compact_ascii(raw: *mut ffi::PyObject) -> bool {
+    const COMPACT: u32 = 1 << 5;
+    const ASCII: u32 = 1 << 6;
+    let header = raw
+        .cast::<u8>()
+        .wrapping_add(std::mem::size_of::<ffi::PyObject>())
+        .cast::<ffi::Py_ssize_t>();
+    let state = unsafe { *header.add(2).cast::<u32>() };
+    state & (COMPACT | ASCII) == COMPACT | ASCII
+}
+
 /// The UTF-8 bytes of a str, or ``None`` when it holds lone surrogates.
 #[inline]
 pub fn utf8<'a>(obj: &'a B<'_>) -> Option<&'a [u8]> {
+    // A compact ASCII str stores its bytes right after its header, already
+    // UTF-8; reading them there skips ``PyUnicode_AsUTF8AndSize``'s checks.
+    unsafe {
+        let raw = obj.as_ptr();
+        if ffi::PyUnicode_Check(raw) != 0 && compact_ascii(raw) {
+            let ascii = raw.cast::<ffi::PyASCIIObject>();
+            let length = (*ascii).length as usize;
+            let data = ascii.add(1).cast::<u8>();
+            return Some(std::slice::from_raw_parts(data, length));
+        }
+    }
     unsafe {
         let mut size: ffi::Py_ssize_t = 0;
         let data = ffi::PyUnicode_AsUTF8AndSize(obj.as_ptr(), &mut size);
