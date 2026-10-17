@@ -61,6 +61,9 @@ if TYPE_CHECKING:
     from numbers import Rational
 
 
+pytestmark = pytest.mark.usefixtures("implementation")
+
+
 _T = TypeVar("_T")
 
 

@@ -40,6 +40,9 @@ if TYPE_CHECKING:
     from treekle.types import Dialect, Hooks, MutablePlainTree
 
 
+pytestmark = pytest.mark.usefixtures("implementation")
+
+
 @pytest.fixture(autouse=True)
 def fresh_encoder_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make every test choose its encoders anew, not read an earlier test's."""

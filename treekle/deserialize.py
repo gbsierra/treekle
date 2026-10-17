@@ -38,6 +38,7 @@ from numbers import Real
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace, UnionType
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Final,
     Literal,
@@ -80,7 +81,7 @@ from treekle.types import (
 )
 
 
-if typing.TYPE_CHECKING:
+if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
 
