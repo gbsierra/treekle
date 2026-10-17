@@ -226,6 +226,8 @@ omit = [
     "*/.venv/*",
     "*/typings/*",
     "*/tools/*",
+    # Wheels the tests extract to tmp_path and run in a subprocess.
+    "*/pytest-of-*/*",
 ]
 
 [tool.coverage.report]
