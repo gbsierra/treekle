@@ -8,10 +8,12 @@ loop checkout's environment, which has all three:
 Encode times each library on the config itself; msgspec's ``to_builtins`` takes
 ``enc_hook=repr``, its only way past the callables the configs hold. msgspec
 cannot decode the configs at all: its unions may not mix a custom type with
-anything but None. So decode times the closest analogue msgspec accepts: each
-config rebuilt as generated dataclasses holding only plain leaves (a callable,
-type or dtype becomes its repr), and for msgspec a tagged ``msgspec.Struct``
-twin. A decode that does not equal its input prints as ``≠``.
+anything but None. So decode times the closest analogue: each config rebuilt as
+generated dataclasses holding only plain leaves (a callable, type or dtype
+becomes its repr). ``msgspec`` decodes it into a tagged ``msgspec.Struct`` twin,
+``msgspec-dataclass`` into the dataclasses themselves. A decode that raises or
+does not equal its input prints as ``≠``; msgspec-dataclass raises wherever a
+union holds two dataclasses, which it cannot tell apart.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from treekle import deserialize, serialize
 
 
 def main() -> int:
-    """Print the encode and decode tables; return the process exit code."""
+    """Print the encode, decode and summary tables; return the process exit code."""
     parser = argparse.ArgumentParser(
         description=(__doc__ or "").strip(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -60,8 +62,11 @@ def main() -> int:
         )
         for label, config in configs
     }
-    print(_table("Encode", rows, names=flags.columns, index=0))
-    print(_table("Decode (analogue)", rows, names=flags.columns, index=1))
+    encode = _cells(rows, names=flags.columns, index=0)
+    decode = _cells(rows, names=flags.columns, index=1)
+    print(_render(encode, title="Encode", names=flags.columns))
+    print(_render(decode, title="Decode (analogue)", names=flags.columns))
+    print(_summary(encode, decode, names=flags.columns))
     return 0
 
 
@@ -158,13 +163,13 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--budget-sec",
         type=float,
-        default=0.2,
+        default=0.002,
         help="Least time one timing repeat runs.",
     )
     parser.add_argument(
         "--repeat",
         type=int,
-        default=7,
+        default=5,
         help="Repeats; the fastest counts.",
     )
 
@@ -289,10 +294,18 @@ def _row(
         times[codec.name] = (
             _best_us(encode, budget_sec=budget_sec, repeat=repeat),
             _best_us(decode, budget_sec=budget_sec, repeat=repeat)
-            if check(decode())
+            if _decodes(decode, check)
             else None,
         )
     return times
+
+
+def _decodes(decode: Callable[[], object], check: Callable[[object], bool]) -> bool:
+    """Return whether ``decode`` runs and reproduces its input."""
+    try:
+        return check(decode())
+    except TypeError:
+        return False
 
 
 def _best_us(fn: Callable[[], object], *, budget_sec: float, repeat: int) -> float:
@@ -305,15 +318,13 @@ def _best_us(fn: Callable[[], object], *, budget_sec: float, repeat: int) -> flo
     return min(batches) / number * 1e6
 
 
-def _table(title: str, rows: dict[str, _Times], *, names: list[str], index: int) -> str:
-    """Render one markdown table: microseconds, then percent of msgspec's time."""
-    relative = [n for n in names if n != "msgspec"] if "msgspec" in names else []
-    header = [*names, *(f"{name} %" for name in relative)]
-    lines = [
-        f"**{title}** (µs per call)\n",
-        "| config | " + " | ".join(header) + " |",
-        "|---|" + "---:|" * len(header),
-    ]
+def _cells(
+    rows: dict[str, _Times],
+    *,
+    names: list[str],
+    index: int,
+) -> dict[str, dict[str, float | None]]:
+    """Return ``{config: {library: µs}}`` for one direction, plus a total row."""
     cells = {
         label: {n: times[n][index] for n in names} for label, times in rows.items()
     }
@@ -323,17 +334,65 @@ def _table(title: str, rows: dict[str, _Times], *, names: list[str], index: int)
         else sum(row[n] or 0.0 for row in cells.values())
         for n in names
     }
+    return cells
+
+
+def _render(
+    cells: dict[str, dict[str, float | None]],
+    *,
+    title: str,
+    names: list[str],
+) -> str:
+    """Render one markdown table: microseconds, then each time vs msgspec's."""
+    relative = [n for n in names if n != "msgspec"] if "msgspec" in names else []
+    header = [*names, *(f"{name} vs msgspec" for name in relative)]
+    lines = [
+        f"**{title}** (µs per call)\n",
+        "| config | " + " | ".join(header) + " |",
+        "|---|" + "---:|" * len(header),
+    ]
     for label, row in cells.items():
         values = [_cell(row[n], "{:.1f}") for n in names]
         percents = [
-            _cell(_percent(row[n], row["msgspec"]), "{:.0f}%") for n in relative
+            _cell(_slower(row[n], row["msgspec"]), "{:+.0f}%") for n in relative
         ]
         lines.append(f"| {label} | " + " | ".join([*values, *percents]) + " |")
     return "\n".join(lines) + "\n"
 
 
-def _percent(value: float | None, base: float | None) -> float | None:
-    return None if value is None or base is None or base == 0 else 100 * value / base
+def _summary(
+    encode: dict[str, dict[str, float | None]],
+    decode: dict[str, dict[str, float | None]],
+    *,
+    names: list[str],
+) -> str:
+    """Render the totals: one row per library, with each time vs msgspec's."""
+    base = "msgspec" in names
+    header = ["encode µs", "decode µs"]
+    if base:
+        header += ["encode vs msgspec", "decode vs msgspec"]
+    lines = [
+        "**Summary** (total µs over every config)\n",
+        "| library | " + " | ".join(header) + " |",
+        "|---|" + "---:|" * len(header),
+    ]
+    totals = [encode["**total**"], decode["**total**"]]
+    for name in names:
+        values = [_cell(total[name], "{:.0f}") for total in totals]
+        if base:
+            values += [
+                _cell(_slower(total[name], total["msgspec"]), "{:+.0f}%")
+                for total in totals
+            ]
+        lines.append(f"| {name} | " + " | ".join(values) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def _slower(value: float | None, base: float | None) -> float | None:
+    """Return how much longer ``value`` takes than ``base``, in percent."""
+    if value is None or base is None or base == 0:
+        return None
+    return 100 * (value / base - 1)
 
 
 def _cell(value: float | None, spec: str) -> str:
@@ -396,6 +455,24 @@ def _msgspec_codec() -> _Codec:
     )
 
 
+def _msgspec_dataclass_codec() -> _Codec:
+    library = cast("_Msgspec", cast("object", importlib.import_module("msgspec")))
+    return _Codec(
+        name="msgspec-dataclass",
+        encode=lambda config: library.to_builtins(config, enc_hook=repr),
+        prepare=functools.partial(_prepare_msgspec_dataclass, library=library),
+    )
+
+
+def _prepare_msgspec_dataclass(analogue: object, *, library: _Msgspec) -> _Prepared:
+    decode = functools.partial(
+        library.convert,
+        library.to_builtins(analogue),
+        type(analogue),
+    )
+    return decode, analogue.__eq__
+
+
 def _prepare_msgspec(
     analogue: object,
     *,
@@ -455,6 +532,7 @@ def _struct(
 
 _CODECS: dict[str, Callable[[], _Codec]] = {
     "msgspec": _msgspec_codec,
+    "msgspec-dataclass": _msgspec_dataclass_codec,
     "treekle-rust": functools.partial(
         _treekle_codec,
         "treekle-rust",

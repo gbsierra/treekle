@@ -53,6 +53,30 @@ def exp000():
 """
 
 
+_TWINS = """
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Left:
+    x: int = 1
+
+
+@dataclass
+class Right:
+    y: int = 2
+
+
+@dataclass
+class Twins:
+    items: list[object] = field(default_factory=lambda: [Left(), Right()])
+
+
+def exp000():
+    return Twins()
+"""
+
+
 @pytest.fixture
 def bench(
     tmp_path: Path,
@@ -64,6 +88,7 @@ def bench(
         "toy": _TOY,
         "nan": "def exp000():\n    return {'x': float('nan')}\n",
         "broken": "def exp000():\n    raise RuntimeError\n",
+        "twins": _TWINS,
     }.items():
         (baselines / name).mkdir(parents=True)
         (baselines / name / "experiments.py").write_text(textwrap.dedent(body))
@@ -105,22 +130,47 @@ def test_every_library_round_trips_the_analogue(
     bench: Callable[..., None],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    bench("msgspec", "treekle-rust", "treekle-python", "pickle", "jsonpickle")
+    bench(
+        "msgspec",
+        "msgspec-dataclass",
+        "treekle-rust",
+        "treekle-python",
+        "pickle",
+        "jsonpickle",
+    )
     out = capsys.readouterr().out
     assert "skipped broken: exp000 raised" in out
-    encode, decode = out.split("**Decode (analogue)**")
-    header = "| config | msgspec | treekle-rust | treekle-python | pickle | jsonpickle | treekle-rust % | treekle-python % | pickle % | jsonpickle % |"
+    encode, rest = out.split("**Decode (analogue)**")
+    decode, summary = rest.split("**Summary**")
+    header = "| config | msgspec | msgspec-dataclass | treekle-rust | treekle-python | pickle | jsonpickle | msgspec-dataclass vs msgspec | treekle-rust vs msgspec | treekle-python vs msgspec | pickle vs msgspec | jsonpickle vs msgspec |"
     assert header in encode
     assert header in decode
     toy = next(line for line in decode.splitlines() if line.startswith("| toy |"))
-    assert "≠" not in toy
+    # Without tags, a dataclass among dicts under ``object`` decodes as a dict.
+    assert toy.count("≠") == 2
+    assert toy.split(" | ")[2] == "≠"
     assert toy.endswith("% |")
     nan = next(line for line in decode.splitlines() if line.startswith("| nan |"))
-    # The msgspec stand-in hands back the same float object, which equals itself.
+    # The msgspec stand-ins hand back the same float object, which equals itself.
     assert nan.count("≠") == 8
+    twins = next(line for line in decode.splitlines() if line.startswith("| twins |"))
+    assert twins.count("≠") == 2
+    assert twins.split(" | ")[2] == "≠"
     total = next(line for line in decode.splitlines() if "**total**" in line)
-    assert total.count("≠") == 8
+    assert total.count("≠") == 10
     assert "≠" not in encode
+    assert (
+        "| library | encode µs | decode µs | encode vs msgspec | decode vs msgspec |"
+        in summary
+    )
+    rows = {
+        line.split(" | ")[0]: line
+        for line in summary.splitlines()
+        if line.startswith("| ")
+    }
+    assert rows["| msgspec"].endswith("| +0% | +0% |")
+    assert rows["| pickle"].endswith("| ≠ |")
+    assert rows["| pickle"].count("%") == 1
 
 
 def test_without_msgspec_the_tables_have_no_percent_columns(
@@ -130,6 +180,7 @@ def test_without_msgspec_the_tables_have_no_percent_columns(
     bench("treekle-rust", "pickle")
     out = capsys.readouterr().out
     assert "| config | treekle-rust | pickle |\n" in out
+    assert "| library | encode µs | decode µs |\n" in out
     assert "%" not in out
 
 
@@ -167,7 +218,8 @@ def _to_builtins(
             f.name: _to_builtins(cast("object", getattr(obj, f.name)))
             for f in dataclasses.fields(obj)
         }
-        return {"$type": type(obj).__name__, **fields}
+        tag = getattr(obj, "__struct_tag__", None)
+        return fields if tag is None else {"$type": tag, **fields}
     if isinstance(obj, list | tuple):
         items = [_to_builtins(item) for item in cast("list[object]", obj)]
         return items if isinstance(obj, list) else tuple(items)
@@ -184,11 +236,17 @@ def _defstruct(
     **options: object,
 ) -> type:
     assert options == {"tag": True, "tag_field": "$type", "kw_only": True}
-    return dataclasses.make_dataclass(name, list(fields), kw_only=True)
+    made = dataclasses.make_dataclass(name, list(fields), kw_only=True)
+    setattr(made, "__struct_tag__", name)  # noqa: B010 -- Not a declared attribute.
+    return made
 
 
 def _convert(value: object, target: object) -> object:
-    """Rebuild ``value`` as ``target``, which names Struct twins by class name."""
+    """Rebuild ``value`` as ``target``, as msgspec would.
+
+    A dict picks its union member by ``$type`` among Struct twins; among plain
+    dataclasses, which carry no tag, a union of two is refused.
+    """
     if isinstance(target, type) and dataclasses.is_dataclass(target):
         fields = {
             field.name: _convert(
@@ -200,8 +258,15 @@ def _convert(value: object, target: object) -> object:
         return cast("object", target(**fields))
     if isinstance(target, UnionType):
         members = cast("tuple[type, ...]", get_args(target))
+        if isinstance(value, dict):
+            mapping = cast("dict[str, object]", value)
+            classes = [m for m in members if dataclasses.is_dataclass(m)]
+            tagged = {getattr(m, "__struct_tag__", None): m for m in classes}
+            if None in tagged and len(classes) > 1:
+                raise TypeError("Type unions may not contain more than one dataclass")
+            return _convert(mapping, tagged.get(mapping.get("$type"), classes[0]))
         named: dict[str, object] = {member.__name__: member for member in members}
-        return _convert(value, named.get(type(value).__name__, object))
+        return _convert(value, named[type(value).__name__])
     if isinstance(target, GenericAlias):
         args = cast("tuple[object, ...]", get_args(target))
         if isinstance(value, dict):
