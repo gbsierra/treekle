@@ -19,6 +19,7 @@ from types import MappingProxyType, MemberDescriptorType, ModuleType, SimpleName
 from typing import (
     TYPE_CHECKING,
     Annotated,
+    ClassVar,
     NamedTuple,
     Protocol,
     TypedDict,
@@ -47,6 +48,7 @@ from treekle.types import ReadError
 
 
 if TYPE_CHECKING:
+    from _collections_abc import dict_items
     from abc import ABCMeta
     from collections.abc import Callable
 
@@ -80,6 +82,13 @@ class Pair(NamedTuple):
 class Point:
     x: int = 0
     y: float = 0.0
+
+
+@dataclass
+class WithClassVar:
+    x: int
+    y: int = 7
+    shared: ClassVar[int] = 0
 
 
 @dataclass
@@ -1316,6 +1325,87 @@ def test_mutated_dataclass_field_facts_match_python(
     monkeypatch.setattr(field, "default_factory", lambda: 4)
     _assert_reads_alike(tagged, ChangingField)
     assert deserialize.from_plain(tagged, ChangingField).x == 4
+
+
+def test_a_field_named_like_the_object_tag_reads_as_the_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = ModuleType("treekle_parity_tag_field")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    named = dataclass(init=False, eq=False)(
+        _class(module.__name__, "Named", **{"py/object": int}),
+    )
+    vars(module).update(Named=named)
+    data = {"py/object": f"{module.__name__}.Named"}
+    _assert_reads_alike(data, named)
+    _assert_reads_alike(data, named, allow_imports=True)
+
+
+class _LoggedName(str):
+    """A ``py/object`` path that logs each time it is compared."""
+
+    __slots__ = ()
+    log: ClassVar[list[str]] = []
+
+    @override
+    def __eq__(self, other: object) -> bool:
+        _LoggedName.log.append("eq")
+        return str.__eq__(self, other)
+
+    __hash__ = str.__hash__
+
+
+class _LoggedRecord(dict[str, object]):
+    """A record that logs each lookup and item read."""
+
+    log: ClassVar[list[str]] = []
+
+    @override
+    def items(self) -> dict_items[str, object]:
+        _LoggedRecord.log.append("items")
+        return super().items()
+
+    @override
+    def __contains__(self, key: object) -> bool:
+        _LoggedRecord.log.append(f"contains {key}")
+        return super().__contains__(key)
+
+
+class _LoggedFlag:
+    """An ``allow_imports`` that logs each time it is asked."""
+
+    log: ClassVar[list[str]] = []
+
+    def __bool__(self) -> bool:
+        _LoggedFlag.log.append("bool")
+        return True
+
+
+@needs_rust
+def test_a_stored_record_runs_the_same_user_code_in_both() -> None:
+    name = f"{Point.__module__}.{Point.__qualname__}"
+    logs: list[tuple[list[str], ...]] = []
+    for function in (deserialize.from_plain, deserialize._python_from_plain):
+        _LoggedName.log.clear()
+        _LoggedFlag.log.clear()
+        _LoggedRecord.log.clear()
+        function({"py/object": _LoggedName(name), "x": 2}, Point, allow_imports=True)
+        flag = cast("bool", cast("object", _LoggedFlag()))
+        function({"py/object": name, "x": 2}, Point, allow_imports=flag)
+        record = _LoggedRecord({"py/object": name, "x": 2})
+        function(record, Point, allow_imports=True)
+        logs.append((_LoggedName.log[:], _LoggedFlag.log[:], _LoggedRecord.log[:]))
+    assert logs[0] == logs[1]
+    assert all(logs[1])
+
+
+def test_a_class_variable_does_not_count_as_a_stored_field() -> None:
+    # ``__dataclass_fields__`` holds the ``ClassVar`` too, so a record with
+    # one key per entry there still lacks ``y``; one naming it is refused.
+    path = f"{WithClassVar.__module__}.{WithClassVar.__qualname__}"
+    _assert_reads_alike({"py/object": path, "x": 1}, WithClassVar)
+    assert deserialize.from_plain({"py/object": path, "x": 1}, WithClassVar).y == 7
+    _assert_reads_alike({"py/object": path, "x": 1, "shared": 2}, WithClassVar)
 
 
 def test_deep_nesting_round_trips_without_recursing() -> None:

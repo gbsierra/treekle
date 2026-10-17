@@ -343,3 +343,33 @@ msgspec 0.22, cattrs 26.2, and mashumaro 3.23 returned:
 
 One cycle shape fails to read: one through a dataclass decoded as its declared
 type.
+
+## Speed
+
+Times are totals over the `exp000` config of each of 43
+[priml](https://github.com/rekursiv-ai/priml) baselines, in ms, with each
+library's time as a percent more than msgspec's:
+
+| library | encode (ms) | encode (%) | decode (ms) | decode (%) |
+|---|---:|---:|---:|---:|
+| msgspec | 0.50 | +0% | 0.15 | +0% |
+| msgspec-dataclass | 0.50 | +1% | ❌ | ❌ |
+| treekle-rust | 0.63 | +27% | 0.86 | +493% |
+| pickle | 2.32 | +369% | 0.95 | +555% |
+| treekle-python | 3.68 | +641% | 14.32 | +9787% |
+| jsonpickle | 20.61 | +4057% | 10.18 | +6930% |
+
+- **encode:** each library on the config itself. msgspec is given
+  `enc_hook=repr`, its only way past the callables a config holds, and writes
+  no class names or shared references, so it writes less than treekle.
+- **decode:** msgspec cannot decode the configs: its unions may not mix a class
+  with anything but `None`. So decode times the closest thing every library
+  reads: each config rebuilt as dataclasses holding only plain values. msgspec
+  reads it into tagged `msgspec.Struct` twins; msgspec-dataclass into the
+  dataclasses themselves, which fails (❌) on 14 configs whose unions hold two
+  dataclasses it cannot tell apart.
+- **treekle-rust**, **treekle-python:** the compiled core, and the Python
+  fallback a platform without a wheel gets.
+
+Python 3.14, one core of an Intel Core Ultra 7 255H. Reproduce with
+[`scripts/bench_configs.py`](scripts/bench_configs.py).

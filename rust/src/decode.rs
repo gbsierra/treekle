@@ -225,7 +225,7 @@ fn member_offset(class: *mut ffi::PyTypeObject, name: &Bound<'_, PyString>) -> O
     const PY_AUDIT_READ: std::ffi::c_int = 2;
     unsafe {
         let found = _PyType_Lookup(class, name.as_ptr());
-        if found.is_null() || ffi::Py_TYPE(found) != &raw mut ffi::PyMemberDescr_Type {
+        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
             return None;
         }
         let descriptor = found.cast::<ffi::PyMemberDescrObject>();
@@ -1058,8 +1058,25 @@ impl<'py, 'g> Decoder<'py, 'g> {
     }
 
     fn allocate(&self, kind: &B<'py>) -> PyResult<B<'py>> {
-        kind.getattr(pyo3::intern!(self.py, "__new__"))?
-            .call1((kind,))
+        let py = self.py;
+        // ``kind.__new__(kind)`` is ``object.__new__(kind)`` when a plain
+        // ``type`` metaclass finds ``object``'s own ``__new__`` and ``kind``
+        // inherits its slot; that call is the slot with no arguments.
+        unsafe {
+            let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
+            let name = pyo3::intern!(py, "__new__").as_ptr();
+            let base = &raw mut ffi::PyBaseObject_Type;
+            if ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
+                && (*class).tp_new.map(|f| f as usize) == (*base).tp_new.map(|f| f as usize)
+                && let Some(new) = (*base).tp_new
+                && !_PyType_Lookup(class, name).is_null()
+                && _PyType_Lookup(class, name) == _PyType_Lookup(base, name)
+            {
+                let made = new(class, PyTuple::empty(py).as_ptr(), std::ptr::null_mut());
+                return Bound::from_owned_ptr_or_err(py, made);
+            }
+        }
+        kind.getattr(pyo3::intern!(py, "__new__"))?.call1((kind,))
     }
 
     // -------------------------------------------------------------- plans --
@@ -1629,6 +1646,16 @@ impl<'py, 'g> Decoder<'py, 'g> {
         }
         if plan.kind == Kind::Union || !self.is_mapping(data)? {
             return self.run_kind(data, target, plan, at);
+        }
+        // A dataclass record read straight into its fields, its tag and
+        // references checked in the same pass, wherever ``decode_object``
+        // would be the decoder: ``py/object`` or no tag at all.
+        if plan.kind == Kind::Object
+            && plan.is_dataclass
+            && is_class(target)
+            && let Some(started) = self.decode_exact_object(data, target, plan, at)?
+        {
+            return Ok(started);
         }
         let value = if self.contains(data, pyo3::intern!(py, "py/ref"))? {
             self.decode_path_reference(data)?
@@ -2369,6 +2396,15 @@ impl<'py, 'g> Decoder<'py, 'g> {
     // while still being judged fits; the rest of the walk decides.
     /// ``_fits``: whether a tag-decoded or referenced ``value`` is acceptable as ``target``.
     fn fits(&mut self, value: &B<'py>, target: &B<'py>, plan: &Rc<Plan>) -> DR<bool> {
+        // An instance of exactly the target class fits it with no Python
+        // code: ``isinstance`` answers an exact type before any
+        // ``__instancecheck__``, and a class target has no parts to judge.
+        if matches!(plan.fits, Fits::IsInstance(None))
+            && tp(value) == target.as_ptr().cast()
+            && plan.args.bind(self.py).is_empty()
+        {
+            return Ok(true);
+        }
         let mut stack: Vec<Judging<'py>> = Vec::new();
         let mut judging: HashSet<(usize, usize)> = HashSet::new();
         let mut pair = (value.clone(), target.clone());
@@ -2498,7 +2534,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
     /// decided by the MRO here.
     fn is_instance(&self, value: &B<'py>, origin: &B<'py>) -> PyResult<bool> {
         if is_class(origin) {
-            let meta = unsafe { ffi::Py_TYPE(origin.as_ptr()) };
+            let meta = unsafe { ob_type(origin.as_ptr()) };
             let check = unsafe {
                 _PyType_Lookup(meta, pyo3::intern!(self.py, "__instancecheck__").as_ptr())
             };
@@ -3162,6 +3198,12 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 self.shown(data)?
             ));
         }
+        if plan.is_dataclass
+            && is_class(target)
+            && let Some(started) = self.decode_exact_object(data, target, plan, at)?
+        {
+            return Ok(started);
+        }
         let key_object = pyo3::intern!(py, "py/object");
         let stored = self.contains(data, key_object)?;
         let mut data = data.clone();
@@ -3264,6 +3306,91 @@ impl<'py, 'g> Decoder<'py, 'g> {
         )))
     }
 
+    /// ``decode_object`` for an exact dict whose keys are all exact strs and
+    /// whose ``py/object``, if any, names ``target``: one pass over the dict,
+    /// matching keys to fields by their bytes. Such keys run no Python code
+    /// when hashed or compared, so the copy without the tag, the second pass
+    /// and the tag's ``==`` that ``decode_object`` makes can be skipped.
+    /// ``None`` hands the record to ``decode_object``, which also words every
+    /// refusal.
+    fn decode_exact_object(
+        &mut self,
+        data: &B<'py>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        at: Loc<'_, 'py>,
+    ) -> DR<Option<Start<'py>>> {
+        let py = self.py;
+        if tp(data) != t_dict() {
+            return Ok(None);
+        }
+        // A flag that is not a bool runs its ``__bool__`` each time it is
+        // asked; ``decode_object`` asks once, so only a real bool comes here.
+        if !matches!(self.allow_imports, Flag::Known(_)) {
+            return Ok(None);
+        }
+        let info = self.dc_info(target, plan)?;
+        if info.names.is_none() {
+            return Ok(None);
+        }
+        let own = plan
+            .import_name
+            .as_ref()
+            .expect("classes have import names")
+            .bind(py);
+        let Some(own) = (tp(own) == t_str()).then(|| utf8(own)).flatten() else {
+            return Ok(None);
+        };
+        let dict = unsafe { data.cast_unchecked::<PyDict>() };
+        let mut entries = Vec::with_capacity(dict.len());
+        let mut stored = false;
+        let mut cursor = 0;
+        for (key, raw) in dict_entries(dict) {
+            let Some(text) = (tp(&key) == t_str()).then(|| utf8(&key)).flatten() else {
+                return Ok(None);
+            };
+            if text == b"py/object" {
+                let named = (tp(&raw) == t_str()).then(|| utf8(&raw)).flatten();
+                if named != Some(own) {
+                    return Ok(None);
+                }
+                stored = true;
+                continue;
+            }
+            match info.slot_of(text, &mut cursor) {
+                Some(slot) => entries.push((key, raw, slot)),
+                None => return Ok(None),
+            }
+        }
+        // A record naming its class whose imports are off reads its fields
+        // just the same, since only the target's own name was accepted.
+        let position = self.built.len();
+        let frame = self.frame(at)?;
+        let reserved = if stored {
+            self.allocate(target)?
+        } else {
+            self.pending()
+        };
+        self.place(frame, &reserved)?;
+        let before = self.bad_len();
+        let members = Vec::with_capacity(entries.len());
+        Ok(Some(Start::Frame(Frame::new(
+            frame,
+            data,
+            Body::Object {
+                entries: entries.into_iter(),
+                info,
+                target: target.clone(),
+                stored,
+                value: reserved,
+                index: position,
+                before,
+                members,
+                pending: None,
+            },
+        ))))
+    }
+
     /// ``_Object.finish``: the dataclass built from its read fields.
     #[allow(clippy::too_many_arguments)]
     fn build_object(
@@ -3283,7 +3410,14 @@ impl<'py, 'g> Decoder<'py, 'g> {
             } else {
                 self.allocate(target)?
             };
-            let rest = self.with_defaults(members, target)?;
+            let rest = if self.declares_exactly(target, &members) {
+                members
+                    .into_iter()
+                    .map(|(key, member, _)| (key, member))
+                    .collect()
+            } else {
+                self.with_defaults(members, target)?
+            };
             (value, rest)
         } else {
             let kwargs = PyDict::new(py);
@@ -3418,6 +3552,41 @@ impl<'py, 'g> Decoder<'py, 'g> {
             }
         }
         field.getattr(slot.name(py))
+    }
+
+    /// Whether ``members`` holds exactly the entries of ``target``'s
+    /// ``__dataclass_fields__``, found as ``getattr`` would with no Python code
+    /// run: then ``with_defaults`` fills nothing and keeps ``members``' order.
+    /// Read without iterating the fields, which is what makes it cheap.
+    fn declares_exactly(&self, target: &B<'py>, members: &[(B<'py>, B<'py>, usize)]) -> bool {
+        let py = self.py;
+        if self.g.field_kind.is_none() {
+            return false;
+        }
+        let name = pyo3::intern!(py, "__dataclass_fields__").as_ptr();
+        unsafe {
+            let class = target.as_ptr().cast::<ffi::PyTypeObject>();
+            let meta = ob_type(target.as_ptr());
+            let type_getattro = ffi::PyType_Type.tp_getattro.map(|f| f as usize);
+            if (*meta).tp_getattro.map(|f| f as usize) != type_getattro
+                || !_PyType_Lookup(meta, name).is_null()
+            {
+                return false;
+            }
+            let declared = _PyType_Lookup(class, name);
+            if declared.is_null() || ob_type(declared) != t_dict() {
+                return false;
+            }
+            if ffi::PyDict_Size(declared) != members.len() as ffi::Py_ssize_t {
+                return false;
+            }
+            // Each member is a field the record read, and fields are
+            // distinct, so a count equal to the dict's means every entry is a
+            // field read; a ``ClassVar`` or ``InitVar`` entry leaves it short.
+            members.iter().all(|(key, _, _)| {
+                tp(key) == t_str() && ffi::PyDict_Contains(declared, key.as_ptr()) == 1
+            })
+        }
     }
 
     fn with_defaults(

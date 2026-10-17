@@ -447,7 +447,7 @@ fn slot_offset(kind: *mut ffi::PyTypeObject, name: &B<'_>) -> Option<isize> {
     }
     unsafe {
         let found = _PyType_Lookup(kind, name.as_ptr());
-        if found.is_null() || ffi::Py_TYPE(found) != &raw mut ffi::PyMemberDescr_Type {
+        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
             return None;
         }
         let descriptor = found.cast::<ffi::PyMemberDescrObject>();
@@ -1729,7 +1729,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 return Ok(None);
             }
             let found = unsafe { _PyType_Lookup(class, key.as_ptr()) };
-            if !found.is_null() && unsafe { (*ffi::Py_TYPE(found)).tp_descr_set.is_some() } {
+            if !found.is_null() && unsafe { (*ob_type(found)).tp_descr_set.is_some() } {
                 return Ok(None);
             }
             keyed.push(([key.clone()], index));

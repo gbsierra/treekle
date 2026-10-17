@@ -83,7 +83,7 @@ def bench(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[Callable[..., None]]:
     """Return a runner of the benchmark over a fake loop checkout."""
-    baselines = tmp_path / "loop/priml/baselines"
+    baselines = tmp_path / "fakepriml/baselines"
     for name, body in {
         "toy": _TOY,
         "nan": "def exp000():\n    return {'x': float('nan')}\n",
@@ -93,7 +93,7 @@ def bench(
         (baselines / name).mkdir(parents=True)
         (baselines / name / "experiments.py").write_text(textwrap.dedent(body))
     (baselines / "toy/experiments_test.py").write_text("def exp000(): ...\n")
-    monkeypatch.setattr(sys, "path", [*sys.path])
+    monkeypatch.setattr(sys, "path", [str(tmp_path), *sys.path])
     monkeypatch.setitem(sys.modules, "msgspec", _fake_msgspec())
     monkeypatch.setitem(sys.modules, "jsonpickle", _fake_jsonpickle())
     spec = importlib.util.spec_from_file_location(
@@ -111,8 +111,8 @@ def bench(
     def run(*columns: str) -> None:
         argv = [
             "bench",
-            "--loop",
-            str(tmp_path),
+            "--priml",
+            "fakepriml",
             "--budget-sec",
             "1e-4",
             "--repeat",
@@ -147,30 +147,40 @@ def test_every_library_round_trips_the_analogue(
     assert header in decode
     toy = next(line for line in decode.splitlines() if line.startswith("| toy |"))
     # Without tags, a dataclass among dicts under ``object`` decodes as a dict.
-    assert toy.count("≠") == 2
-    assert toy.split(" | ")[2] == "≠"
+    assert toy.count("❌") == 2
+    assert toy.split(" | ")[2] == "❌"
     assert toy.endswith("% |")
     nan = next(line for line in decode.splitlines() if line.startswith("| nan |"))
     # The msgspec stand-ins hand back the same float object, which equals itself.
-    assert nan.count("≠") == 8
+    assert nan.count("❌") == 8
     twins = next(line for line in decode.splitlines() if line.startswith("| twins |"))
-    assert twins.count("≠") == 2
-    assert twins.split(" | ")[2] == "≠"
+    assert twins.count("❌") == 2
+    assert twins.split(" | ")[2] == "❌"
     total = next(line for line in decode.splitlines() if "**total**" in line)
-    assert total.count("≠") == 10
-    assert "≠" not in encode
+    assert total.count("❌") == 10
+    assert "❌" not in encode
     assert (
-        "| library | encode µs | decode µs | encode vs msgspec | decode vs msgspec |"
-        in summary
+        "| library | encode (ms) | encode (%) | decode (ms) | decode (%) |" in summary
     )
     rows = {
         line.split(" | ")[0]: line
         for line in summary.splitlines()
         if line.startswith("| ")
     }
-    assert rows["| msgspec"].endswith("| +0% | +0% |")
-    assert rows["| pickle"].endswith("| ≠ |")
+    assert rows["| msgspec"].split(" | ")[2] == "+0%"
+    assert rows["| msgspec"].endswith("| +0% |")
+    assert rows["| pickle"].endswith("| ❌ | ❌ |")
     assert rows["| pickle"].count("%") == 1
+    # Rows run fastest encode first, by the totals the encode table prints.
+    totals = next(line for line in encode.splitlines() if "**total**" in line)
+    names = [str(name) for name in header.split(" | ")[1:7]]
+    by_name = dict(zip(names, totals.split(" | ")[1:7], strict=True))
+    order = [line.split(" | ")[0].removeprefix("| ") for line in summary.splitlines()]
+    order = [name for name in order if name in by_name]
+    assert len(order) == 6
+    assert [float(by_name[name]) for name in order] == sorted(
+        float(by_name[name]) for name in order
+    )
 
 
 def test_without_msgspec_the_tables_have_no_percent_columns(
@@ -180,7 +190,7 @@ def test_without_msgspec_the_tables_have_no_percent_columns(
     bench("treekle-rust", "pickle")
     out = capsys.readouterr().out
     assert "| config | treekle-rust | pickle |\n" in out
-    assert "| library | encode µs | decode µs |\n" in out
+    assert "| library | encode (ms) | decode (ms) |\n" in out
     assert "%" not in out
 
 

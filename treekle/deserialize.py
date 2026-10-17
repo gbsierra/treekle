@@ -347,6 +347,15 @@ def _start_node(
     decoder = _decoder_for(target)
     if decoder is _decode_union or not isinstance(data, Mapping):
         return decoder(data, target, at, state)
+    if decoder is _decode_object and kind is dict:
+        frame = _decode_exact_object(
+            cast("dict[str, PlainTree]", data),
+            target,
+            at,
+            state,
+        )
+        if frame is not None:
+            return frame
     if "py/ref" in data:
         value = _decode_path_reference(data, state)
     elif "py/id" in data:
@@ -1225,6 +1234,62 @@ def _decode_object(
     )
 
 
+def _decode_exact_object(
+    data: dict[str, PlainTree],
+    target: object,
+    at: FieldPath,
+    state: _Decoding,
+) -> _Object | None:
+    """Start a dataclass record in one pass, else ``None`` for the full path.
+
+    Taken for a dict whose keys are all ``str``, each a field of ``target``
+    but a ``py/object`` naming ``target`` itself. Such a record reads as
+    ``_start_node`` and ``_decode_object`` would read it, minus their
+    reference and tag lookups and the copy without the tag; anything else,
+    refusals included, goes the full path, which words every error.
+    """
+    if (
+        not isinstance(target, type)
+        or not is_dataclass(target)
+        # ``_names_dataclass`` asks ``not allow_imports`` of each record, which
+        # a flag that is not a bool answers with its own ``__bool__``.
+        or type(cast("object", state.allow_imports)) is not bool
+    ):
+        return None
+    types = _field_types(target)
+    stored = False
+    for key, raw in data.items():
+        if type(key) is not str:
+            return None
+        if key == "py/object":
+            if (
+                type(raw) is not str
+                or raw != f"{target.__module__}.{target.__qualname__}"
+            ):
+                return None
+            stored = True
+        elif key not in types:
+            return None
+    if stored and "py/object" in types:
+        return None
+    index = len(state.built)
+    value = _allocate(target) if stored else PENDING
+    _place(value, at, state)
+    # The full path also has a stored record's built object checked against
+    # ``target``; that object is exactly ``target``, which ``isinstance``
+    # answers without any ``__instancecheck__``, so the check is left out.
+    return _Object(
+        at,
+        data=data,
+        types=types,
+        target=target,
+        stored=stored,
+        value=value,
+        index=index,
+        before=len(state.bad),
+    )
+
+
 def _decode_stored(
     data: Mapping[str, PlainTree],
     at: FieldPath,
@@ -1490,7 +1555,9 @@ class _Items(_PartFrame):
     def step(self, state: _Decoding) -> _Frame | None:
         at = self.at
         for index, (raw, target) in self.parts:
-            if target is object and type(raw) in _PLAIN_LEAVES:
+            # ``_start_node``'s first answer: a plain leaf read as ``object``
+            # or as exactly its own type is itself.
+            if (target is object or target is type(raw)) and type(raw) in _PLAIN_LEAVES:
                 self.take(raw, state)
                 continue
             where = (*at, index)
@@ -1587,7 +1654,9 @@ class _Entries(_PartFrame):
                 except ReadError as error:
                     _invalid(key, str(error), where, state)
                     continue
-            if value_type is object and type(raw) in _PLAIN_LEAVES:
+            if (value_type is object or value_type is type(raw)) and type(
+                raw,
+            ) in _PLAIN_LEAVES:
                 result[decoded] = raw
                 continue
             value = _start_part(raw, value_type, where, state)
@@ -1640,7 +1709,7 @@ class _Fields(_PartFrame):
                 target = types[name]
             else:
                 continue
-            if target is object and type(raw) in _PLAIN_LEAVES:
+            if (target is object or target is type(raw)) and type(raw) in _PLAIN_LEAVES:
                 members[name] = raw
                 continue
             where = (*at, name)

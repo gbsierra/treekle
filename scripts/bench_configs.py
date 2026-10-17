@@ -1,9 +1,10 @@
 """Time msgspec, treekle, pickle and jsonpickle on every priml ``exp000`` config.
 
-priml, msgspec and jsonpickle are not treekle dependencies, so run this from a
-loop checkout's environment, which has all three:
+priml, msgspec and jsonpickle are not treekle dependencies, so run this in an
+environment that has all three:
 
-  PYTHONPATH=. ~/loop/.venv/bin/python scripts/bench_configs.py --loop ~/loop
+  python scripts/bench_configs.py
+  python scripts/bench_configs.py --priml my.vendored.priml --columns msgspec pickle
 
 Encode times each library on the config itself; msgspec's ``to_builtins`` takes
 ``enc_hook=repr``, its only way past the callables the configs hold. msgspec
@@ -12,8 +13,9 @@ anything but None. So decode times the closest analogue: each config rebuilt as
 generated dataclasses holding only plain leaves (a callable, type or dtype
 becomes its repr). ``msgspec`` decodes it into a tagged ``msgspec.Struct`` twin,
 ``msgspec-dataclass`` into the dataclasses themselves. A decode that raises or
-does not equal its input prints as ``≠``; msgspec-dataclass raises wherever a
-union holds two dataclasses, which it cannot tell apart.
+does not equal its input prints as ❌, as does a total that includes one;
+msgspec-dataclass raises wherever a union holds two dataclasses, which it cannot
+tell apart.
 """
 
 from __future__ import annotations
@@ -44,8 +46,7 @@ def main() -> int:
     )
     _add_arguments(parser)
     flags = cast("Flags", parser.parse_args())
-    sys.path.insert(0, str(flags.loop))
-    configs, skipped = _configs(flags.loop / "loop/priml/baselines", root=flags.loop)
+    configs, skipped = _configs(f"{flags.priml}.baselines")
     for label in skipped:
         print(f"skipped {label}: exp000 raised")
     module = ModuleType("treekle_bench_analogue")
@@ -73,7 +74,7 @@ def main() -> int:
 class Flags(Protocol):
     """Parsed command-line flags."""
 
-    loop: Path
+    priml: str
     columns: list[str]
     budget_sec: float
     repeat: int
@@ -148,10 +149,9 @@ class _Jsonpickle(Protocol):
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
     """Register flags on ``parser``."""
     parser.add_argument(
-        "--loop",
-        type=Path,
-        required=True,
-        help="The loop checkout holding priml.",
+        "--priml",
+        default="priml",
+        help="The importable name of the priml package.",
     )
     parser.add_argument(
         "--columns",
@@ -174,18 +174,16 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _configs(
-    baselines: Path,
-    *,
-    root: Path,
-) -> tuple[list[tuple[str, object]], list[str]]:
-    """Build every ``exp000`` under ``baselines``; return them and those that raised."""
+def _configs(package: str) -> tuple[list[tuple[str, object]], list[str]]:
+    """Build every ``exp000`` under ``package``; return them and those that raised."""
+    module = importlib.import_module(package)
+    baselines = Path(next(iter(cast("Iterable[str]", module.__path__))))
     configs: list[tuple[str, object]] = []
     skipped: list[str] = []
     for path in sorted(baselines.rglob("experiments*.py")):
         if path.name.endswith("_test.py") or "def exp000(" not in path.read_text():
             continue
-        name = ".".join(path.relative_to(root).with_suffix("").parts)
+        name = ".".join([package, *path.relative_to(baselines).with_suffix("").parts])
         label = str(path.relative_to(baselines).with_suffix("")).removesuffix(
             "/experiments",
         )
@@ -368,22 +366,25 @@ def _summary(
 ) -> str:
     """Render the totals: one row per library, with each time vs msgspec's."""
     base = "msgspec" in names
-    header = ["encode µs", "decode µs"]
-    if base:
-        header += ["encode vs msgspec", "decode vs msgspec"]
+    header = (
+        ["encode (ms)", "encode (%)", "decode (ms)", "decode (%)"]
+        if base
+        else ["encode (ms)", "decode (ms)"]
+    )
     lines = [
-        "**Summary** (total µs over every config)\n",
+        "**Summary** (total ms over every config)\n",
         "| library | " + " | ".join(header) + " |",
         "|---|" + "---:|" * len(header),
     ]
     totals = [encode["**total**"], decode["**total**"]]
-    for name in names:
-        values = [_cell(total[name], "{:.0f}") for total in totals]
-        if base:
-            values += [
-                _cell(_slower(total[name], total["msgspec"]), "{:+.0f}%")
-                for total in totals
-            ]
+    fastest = sorted(names, key=lambda name: totals[0][name] or float("inf"))
+    for name in fastest:
+        values: list[str] = []
+        for total in totals:
+            us = total[name]
+            values.append(_cell(None if us is None else us / 1000, "{:.2f}"))
+            if base:
+                values.append(_cell(_slower(total[name], total["msgspec"]), "{:+.0f}%"))
         lines.append(f"| {name} | " + " | ".join(values) + " |")
     return "\n".join(lines) + "\n"
 
@@ -396,7 +397,7 @@ def _slower(value: float | None, base: float | None) -> float | None:
 
 
 def _cell(value: float | None, spec: str) -> str:
-    return "≠" if value is None else spec.format(value)
+    return "❌" if value is None else spec.format(value)
 
 
 def _treekle_codec(

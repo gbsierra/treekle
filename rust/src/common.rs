@@ -303,7 +303,21 @@ unsafe fn heap_qualname(kind: *mut ffi::PyTypeObject) -> *mut ffi::PyObject {
 
 #[inline(always)]
 pub fn tp(obj: &B<'_>) -> *mut ffi::PyTypeObject {
-    unsafe { ffi::Py_TYPE(obj.as_ptr()) }
+    unsafe { ob_type(obj.as_ptr()) }
+}
+
+/// Whether ``raw``'s class has ``flag``, as the ``Py*_Check`` macros test.
+#[inline(always)]
+pub fn has_flag(raw: *mut ffi::PyObject, flag: std::ffi::c_ulong) -> bool {
+    unsafe { (*ob_type(raw)).tp_flags & flag != 0 }
+}
+
+/// ``Py_TYPE``, read from the object header. pyo3 binds 3.14's ``Py_TYPE`` as
+/// an exported function, which no call site inlines; on the GIL build (the
+/// only one this module compiles for) the header still holds ``ob_type``.
+#[inline(always)]
+pub unsafe fn ob_type(raw: *mut ffi::PyObject) -> *mut ffi::PyTypeObject {
+    unsafe { (*raw).ob_type }
 }
 
 macro_rules! type_ptr {
@@ -327,17 +341,17 @@ type_ptr!(t_object, PyBaseObject_Type);
 
 #[inline(always)]
 pub fn t_none() -> *mut ffi::PyTypeObject {
-    unsafe { ffi::Py_TYPE(ffi::Py_None()) }
+    unsafe { ob_type(ffi::Py_None()) }
 }
 
 #[inline(always)]
 pub fn is_str(obj: &B<'_>) -> bool {
-    unsafe { ffi::PyUnicode_Check(obj.as_ptr()) != 0 }
+    has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_UNICODE_SUBCLASS)
 }
 
 #[inline(always)]
 pub fn is_int(obj: &B<'_>) -> bool {
-    unsafe { ffi::PyLong_Check(obj.as_ptr()) != 0 }
+    has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_LONG_SUBCLASS)
 }
 
 #[inline(always)]
@@ -347,22 +361,22 @@ pub fn is_float(obj: &B<'_>) -> bool {
 
 #[inline(always)]
 pub fn is_tuple(obj: &B<'_>) -> bool {
-    unsafe { ffi::PyTuple_Check(obj.as_ptr()) != 0 }
+    has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_TUPLE_SUBCLASS)
 }
 
 #[inline(always)]
 pub fn is_list(obj: &B<'_>) -> bool {
-    unsafe { ffi::PyList_Check(obj.as_ptr()) != 0 }
+    has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_LIST_SUBCLASS)
 }
 
 #[inline(always)]
 pub fn is_dict(obj: &B<'_>) -> bool {
-    unsafe { ffi::PyDict_Check(obj.as_ptr()) != 0 }
+    has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_DICT_SUBCLASS)
 }
 
 #[inline(always)]
 pub fn is_class(obj: &B<'_>) -> bool {
-    unsafe { ffi::PyType_Check(obj.as_ptr()) != 0 }
+    has_flag(obj.as_ptr(), ffi::Py_TPFLAGS_TYPE_SUBCLASS)
 }
 
 #[inline(always)]
@@ -398,7 +412,7 @@ pub fn is_unhashable(obj: &B<'_>) -> PyResult<bool> {
     // ``__hash__``, which CPython keeps in step with ``tp_hash``. Any other
     // metaclass may answer the lookup itself (a ``__getattribute__``, a
     // ``__hash__`` property) while the slot still hashes.
-    if unsafe { ffi::Py_TYPE(kind.cast()) } == &raw mut ffi::PyType_Type {
+    if unsafe { ob_type(kind.cast()) } == &raw mut ffi::PyType_Type {
         return Ok(unsafe { (*kind).tp_hash }.map(|f| f as usize) == hash_not_implemented());
     }
     let py = obj.py();
@@ -432,7 +446,7 @@ pub fn utf8<'a>(obj: &'a B<'_>) -> Option<&'a [u8]> {
     // UTF-8; reading them there skips ``PyUnicode_AsUTF8AndSize``'s checks.
     unsafe {
         let raw = obj.as_ptr();
-        if ffi::PyUnicode_Check(raw) != 0 && compact_ascii(raw) {
+        if has_flag(raw, ffi::Py_TPFLAGS_UNICODE_SUBCLASS) && compact_ascii(raw) {
             let ascii = raw.cast::<ffi::PyASCIIObject>();
             let length = (*ascii).length as usize;
             let data = ascii.add(1).cast::<u8>();
@@ -523,7 +537,7 @@ pub fn is_str_keyed_dict(obj: &B<'_>) -> bool {
     let mut value = std::ptr::null_mut();
     unsafe {
         while ffi::PyDict_Next(obj.as_ptr(), &mut position, &mut key, &mut value) != 0 {
-            if ffi::Py_TYPE(key) != t_str() {
+            if ob_type(key) != t_str() {
                 return false;
             }
         }
