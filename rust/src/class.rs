@@ -202,6 +202,9 @@ pub struct ClassInfo {
     pub layouts: [Option<Rc<Layout>>; 2],
     /// Whether it reduces as ``Enum.__reduce_ex__`` does, read natively.
     pub enum_member: Option<bool>,
+    /// Whether its instances' ``__reduce_ex__(2)`` is ``object``'s own calling
+    /// a custom ``__reduce__``, so the call can be made without Python's.
+    pub own_reduce: Option<bool>,
     /// The ``__dict__`` keys of the last instance read, by identity, and the
     /// order sorting gave them; instances of one class usually share both.
     pub dict_order: Option<DictOrder>,
@@ -227,6 +230,38 @@ pub struct Layout {
     /// When each slot has an offset, no slot name is a tag, and instances
     /// carry no ``__dict__``: the members are then exactly the slots, in order.
     pub direct: bool,
+    /// Whether the class has no slots, generic lookup, and the plain
+    /// ``__dict__`` descriptor, so ``getattr(instance, "__dict__")`` is the
+    /// instance dict that generic lookup reads members from.
+    pub dict_plain: bool,
+    /// Whether an offset holds only a set slot: an unset one is still read
+    /// by ``getattr``, which calls the class's ``__getattr__``.
+    pub hooked: bool,
+    /// Whether every slot has an offset, so reading members runs no code.
+    pub all_slots: bool,
+    /// Whether ``getattr(instance, "__dict__", None)`` is ``None`` without
+    /// running any code.
+    pub no_dict: bool,
+    /// Whether every slot name is an exact str other than ``py/object``.
+    pub clean: bool,
+    /// Each slot name as JSON text, quoted, where it is ASCII that needs no
+    /// escape and so reads the same under every ``Style``.
+    pub key_texts: Vec<Option<Box<[u8]>>>,
+    /// How the last instance dict read under ``dict_plain`` was named.
+    pub dict_keys: std::cell::RefCell<Option<Rc<DictKeys>>>,
+}
+
+/// What an instance dict's key sequence implies for its members, checked
+/// once per sequence while the class's stamp holds: every key is an exact
+/// str other than ``py/object`` that no data descriptor on the class shadows,
+/// so ``getattr(instance, key)`` is the dict's own value and runs no code.
+pub struct DictKeys {
+    /// The keys in insertion order, matched by identity.
+    pub keys: Vec<Py<PyAny>>,
+    /// The insertion index of each member in ``attribute_names`` order.
+    pub order: Vec<u8>,
+    /// Each member's name as JSON text, by output position.
+    pub texts: Vec<Option<Box<[u8]>>>,
 }
 
 /// ``_PyType_Lookup``: the first of the MRO's dicts holding ``name``. Read
@@ -319,7 +354,34 @@ impl Layout {
             names: PyTuple::new(py, names)?.unbind(),
             offsets: offsets.into_boxed_slice(),
             direct,
-        })
+            dict_plain: false,
+            hooked: false,
+            all_slots: false,
+            no_dict: false,
+            clean: false,
+            key_texts: Vec::new(),
+            dict_keys: std::cell::RefCell::new(None),
+        }
+        .finished(py))
+    }
+
+    /// The text-walk facts that follow from the names and offsets: whether
+    /// every slot has an offset and a clean name, and each name's text.
+    pub fn finished(mut self, py: Python<'_>) -> Self {
+        let names = self.names.bind(py);
+        self.all_slots = !self.hooked && self.offsets.iter().all(Option::is_some);
+        self.clean = names.iter().all(|name| {
+            tp(&name) == t_str() && utf8(&name).is_some_and(|text| text != b"py/object")
+        });
+        self.key_texts = names
+            .iter()
+            .map(|name| {
+                (tp(&name) == t_str())
+                    .then(|| crate::json::plain_key_text(&name))
+                    .flatten()
+            })
+            .collect();
+        self
     }
 }
 
@@ -660,12 +722,22 @@ pub unsafe fn layout_from(
     unsafe {
         let names = Bound::from_borrowed_ptr(py, read.names).cast_into_unchecked::<PyTuple>();
         if sort {
-            return Some(Layout {
-                stamp,
-                names: names.unbind(),
-                offsets: offsets.into(),
-                direct: true,
-            });
+            return Some(
+                Layout {
+                    stamp,
+                    names: names.unbind(),
+                    offsets: offsets.into(),
+                    direct: true,
+                    dict_plain: false,
+                    hooked: false,
+                    all_slots: false,
+                    no_dict: true,
+                    clean: false,
+                    key_texts: Vec::new(),
+                    dict_keys: std::cell::RefCell::new(None),
+                }
+                .finished(py),
+            );
         }
         // ``__slots__``' order: each name is one ``ht_slots`` holds, or the
         // ``__weakref__`` slot, which carries no state.
@@ -680,12 +752,22 @@ pub unsafe fn layout_from(
             order.push(name);
             kept.push(offsets[at]);
         }
-        Some(Layout {
-            stamp,
-            names: PyTuple::new(py, order).ok()?.unbind(),
-            offsets: kept.into_boxed_slice(),
-            direct: true,
-        })
+        Some(
+            Layout {
+                stamp,
+                names: PyTuple::new(py, order).ok()?.unbind(),
+                offsets: kept.into_boxed_slice(),
+                direct: true,
+                dict_plain: false,
+                hooked: false,
+                all_slots: false,
+                no_dict: true,
+                clean: false,
+                key_texts: Vec::new(),
+                dict_keys: std::cell::RefCell::new(None),
+            }
+            .finished(py),
+        )
     }
 }
 
@@ -822,7 +904,7 @@ pub fn native_import_path_in<'py>(
     for part in &parts[module_parts..] {
         let next = if walked.get_type().as_ptr() == g.module_type.as_ptr() {
             module_dict(&walked).get_item(*part)?
-        } else if unsafe { ob_type(walked.as_ptr()) } == &raw mut ffi::PyType_Type {
+        } else if ob_type(walked.as_ptr()) == &raw mut ffi::PyType_Type {
             let name = PyString::new(py, part);
             let found = unsafe { _PyType_Lookup(walked.as_ptr().cast(), name.as_ptr()) };
             // A descriptor found there could answer ``getattr`` itself.

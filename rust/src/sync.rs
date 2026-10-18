@@ -103,6 +103,8 @@ impl Watch {
         if std::ptr::eq(self, &MODULES) {
             // Noted before watching, so its first change is told apart.
             MODULES_DICT.store(dict.as_ptr() as usize, Ordering::Relaxed);
+        } else if std::ptr::eq(self, &DECODE) {
+            note_decode_dict(dict.as_ptr() as usize);
         }
         // Watching fails only for a non-dict or a bad id, and neither is passed.
         unsafe { PyDict_Watch(id, dict.as_ptr()) };
@@ -259,6 +261,13 @@ unsafe extern "C" fn changed(
     _new_value: *mut ffi::PyObject,
 ) -> c_int {
     MODULES.generation.fetch_add(1, Ordering::Relaxed);
+    if is_decode_dict(dict as usize) {
+        DECODE.generation.fetch_add(1, Ordering::Relaxed);
+        if event == PY_DICT_EVENT_DEALLOCATED {
+            forget_decode_dict(dict as usize);
+        }
+        return 0;
+    }
     if dict as usize == MODULES_DICT.load(Ordering::Relaxed) {
         // A freed ``sys.modules`` forgets its address, so a dict made there
         // later is not taken for it.
@@ -285,3 +294,41 @@ pub static ENCODE: Watch = Watch::new();
 
 /// ``sys.modules``, so a module found there by name stays found until it moves.
 pub static MODULES: Watch = Watch::new();
+
+/// The dicts ``from_plain`` copies import results from: the
+/// ``treekle.deserialize`` globals and their ``_RESOLVED`` cache. Their
+/// changes move ``DECODE`` alone, so resolving an import leaves the
+/// encoder's kept facts standing.
+pub static DECODE: Watch = Watch::new();
+
+/// The dicts ``DECODE`` watches, by address; 0 marks a free entry.
+static DECODE_DICTS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+#[inline]
+fn is_decode_dict(address: usize) -> bool {
+    DECODE_DICTS
+        .iter()
+        .any(|each| each.load(Ordering::Relaxed) == address)
+}
+
+fn note_decode_dict(address: usize) {
+    if is_decode_dict(address) {
+        return;
+    }
+    // A dict past the table's room moves both sets of generations, which is
+    // never wrong: decoding then rereads, as does encoding.
+    for each in &DECODE_DICTS {
+        if each
+            .compare_exchange(0, address, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+fn forget_decode_dict(address: usize) {
+    for each in &DECODE_DICTS {
+        let _ = each.compare_exchange(address, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
