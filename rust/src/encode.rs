@@ -4142,9 +4142,7 @@ impl<'py> Encoder<'py, '_> {
             self.w.item_sep();
             match &layout.key_texts[index] {
                 Some(text) => self.w.raw(text),
-                None => self
-                    .w
-                    .str(&layout.slots(py).nth(index).expect("in range").0),
+                None => self.w.str(&layout.name(py, index)),
             }
             self.w.key_sep();
             if self.text_leaf(&member)? != Leaf::Written {
@@ -4163,7 +4161,7 @@ impl<'py> Encoder<'py, '_> {
             if let Some(member) = read_slot(value, offset)
                 && member.as_ptr() != pending
             {
-                members.push((layout.slots(py).nth(at).expect("in range").0, member, false));
+                members.push((layout.name(py, at), member, false));
             }
         }
         self.text_open(Items::Entries(members), frame, true, Close::Dict);

@@ -313,6 +313,12 @@ impl Layout {
         self.offsets.len()
     }
 
+    /// The name of slot ``index``, borrowed from ``names``.
+    #[inline]
+    pub fn name<'py>(&self, py: Python<'py>, index: usize) -> B<'py> {
+        unsafe { self.names.bind(py).get_borrowed_item_unchecked(index) }.to_owned()
+    }
+
     /// Each slot's name with its offset.
     pub fn slots<'a, 'py>(
         &'a self,
