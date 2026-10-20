@@ -31,9 +31,9 @@ unsafe extern "C" {
 const UNTRIED: i32 = -2;
 const UNAVAILABLE: i32 = -1;
 
-/// One watcher's generations. ``ENCODE`` and ``MODULES`` share one CPython
-/// watcher slot (``SLOT``), of the few an interpreter allows; one callback
-/// tells their dicts apart and advances each set of generations.
+/// One watcher's generations. ``ENCODE``, ``MODULES`` and ``DECODE`` share
+/// one CPython watcher slot (``SLOT``), of the few an interpreter allows; one
+/// callback tells their dicts apart and advances each set of generations.
 pub struct Watch {
     generation: AtomicU64,
     /// Advanced by every change but an entry added for ``expected``.
@@ -100,11 +100,11 @@ impl Watch {
         let Some(id) = self.id(py) else {
             return false;
         };
+        // Noted before watching, so its first change is told apart.
         if std::ptr::eq(self, &MODULES) {
-            // Noted before watching, so its first change is told apart.
             MODULES_DICT.store(dict.as_ptr() as usize, Ordering::Relaxed);
-        } else if std::ptr::eq(self, &DECODE) {
-            note_decode_dict(dict.as_ptr() as usize);
+        } else if std::ptr::eq(self, &DECODE) && !note_decode_dict(dict.as_ptr() as usize) {
+            return false;
         }
         // Watching fails only for a non-dict or a bad id, and neither is passed.
         unsafe { PyDict_Watch(id, dict.as_ptr()) };
@@ -247,13 +247,14 @@ pub fn planted(address: usize) -> bool {
     PLANTED[word].load(Ordering::Relaxed) & bit != 0
 }
 
-/// The one callback for every dict either ``Watch`` watches.
+/// The one callback for every dict any ``Watch`` watches.
 ///
-/// ``sys.modules`` moves only ``MODULES``: imports are common, and each would
-/// otherwise drop every fact a walk kept. Every other dict moves both, which
-/// is never wrong: an extra ``MODULES`` change only reads a module again.
-/// A ``sys.modules`` replaced since it was watched is told apart no longer,
-/// so it too moves both.
+/// Every dict moves ``MODULES``, which is never wrong: an extra change only
+/// reads a module again. A ``DECODE`` dict moves ``DECODE`` too, and
+/// ``sys.modules`` nothing more: imports are common, and each would otherwise
+/// drop every fact a walk kept. Every other dict is an ``ENCODE`` dict. A
+/// ``sys.modules`` replaced since it was watched is told apart no longer, so
+/// it moves ``ENCODE`` too.
 unsafe extern "C" fn changed(
     event: c_int,
     dict: *mut ffi::PyObject,
@@ -311,20 +312,14 @@ fn is_decode_dict(address: usize) -> bool {
         .any(|each| each.load(Ordering::Relaxed) == address)
 }
 
-fn note_decode_dict(address: usize) {
-    if is_decode_dict(address) {
-        return;
-    }
-    // A dict past the table's room moves both sets of generations, which is
-    // never wrong: decoding then rereads, as does encoding.
-    for each in &DECODE_DICTS {
-        if each
-            .compare_exchange(0, address, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
-        }
-    }
+/// Note ``address`` as a ``DECODE`` dict; ``false`` when the table is full,
+/// as its changes would then move ``ENCODE`` instead.
+fn note_decode_dict(address: usize) -> bool {
+    is_decode_dict(address)
+        || DECODE_DICTS.iter().any(|each| {
+            each.compare_exchange(0, address, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        })
 }
 
 fn forget_decode_dict(address: usize) {

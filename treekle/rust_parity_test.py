@@ -2465,6 +2465,131 @@ def test_a_reduce_property_writes_as_python_does(kind: Callable[[], object]) -> 
     _assert_writes_alike_each_time(kind())
 
 
+class _HidesReduce(type):
+    """Answers ``__reduce__`` with ``object``'s, hiding the class's own."""
+
+    @override
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__reduce__":
+            return object.__reduce__
+        return cast("object", super().__getattribute__(name))
+
+
+class ReduceHiddenByMetaclass(metaclass=_HidesReduce):
+    __slots__ = ()
+
+    @override
+    def __reduce__(self) -> tuple[object, ...]:
+        return (ReduceHiddenByMetaclass, ())
+
+
+# ``object.__reduce_ex__`` reads ``__reduce__`` through the metaclass, so one
+# that hides the class's own leaves copyreg's recipe.
+def test_a_reduce_the_metaclass_hides_writes_as_python_does() -> None:
+    _assert_writes_alike_each_time(ReduceHiddenByMetaclass())
+
+
+class _CountsModuleReads(type):
+    """Counts each read of ``__module__``."""
+
+    reads: ClassVar[int] = 0
+
+    @override
+    def __getattribute__(cls, name: str) -> object:
+        if name == "__module__":
+            _CountsModuleReads.reads += 1
+        return cast("object", super().__getattribute__(name))
+
+
+class ReducesToAnUnknownName(metaclass=_CountsModuleReads):
+    __slots__ = ()
+
+    @override
+    def __reduce__(self) -> str:
+        return "unknown_name"
+
+
+@pytest.mark.parametrize(
+    "function",
+    [serialize._python_to_plain, serialize.to_plain, wire.json_dumps],
+    ids=["python", "to_plain", "json_dumps"],
+)
+def test_a_bare_name_reduce_reads_the_module_once_as_python_does(
+    function: Callable[[object], object],
+) -> None:
+    for _ in range(_TIMES):
+        _CountsModuleReads.reads = 0
+        with pytest.raises(TypeError, match="does not resolve"):
+            function(ReducesToAnUnknownName())
+        assert _CountsModuleReads.reads == 1
+
+
+@needs_rust
+@pytest.mark.parametrize("slots", [False, True], ids=["dict-backed", "slotted"])
+def test_a_member_that_drops_a_later_member_writes_as_python_does(
+    slots: bool,
+) -> None:
+    # Python reads every member before encoding any, so the dropped list is
+    # still written; read lazily, it would be gone, or freed, by its turn.
+    printed = _run_python(
+        f"""
+        from dataclasses import dataclass
+        import gc
+        import json
+        from treekle import serialize, wire
+
+        class Drops:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def __reduce__(self):
+                if self.owner is not None and hasattr(self.owner, "b"):
+                    del self.owner.b
+                    gc.collect()
+                    [bytearray(64) for _ in range(1000)]
+                return (Drops, (None,))
+
+        @dataclass(slots={slots})
+        class Owner:
+            a: object
+            b: object
+
+        def built():
+            owner = Owner(None, None)
+            owner.a, owner.b = Drops(owner), ["only", ["held", "here"]]
+            return [owner]
+
+        tree = serialize._python_to_plain(built())
+        text = json.dumps(tree)
+        print(*(serialize.to_plain(built()) == tree for _ in range(3)))
+        print(*(wire.json_dumps(built()) == text for _ in range(3)))
+        """,
+    )
+    assert printed == "True True True\nTrue True True"
+
+
+@needs_rust
+def test_a_resolved_cache_replaced_many_times_is_still_read() -> None:
+    # Each replacement is another dict for the reader to watch.
+    printed = _run_python(
+        """
+        import os
+        import treekle.deserialize as deserialize
+
+        path = "collections.OrderedDict"
+        kept = []
+        for _ in range(6):
+            deserialize._RESOLVED = {}
+            kept.append(deserialize._RESOLVED)
+            for _ in range(2):
+                deserialize.from_plain({"py/type": path}, object, allow_imports=True)
+        deserialize._RESOLVED[path] = os.PathLike
+        print(deserialize.from_plain({"py/type": path}, object, allow_imports=True))
+        """,
+    )
+    assert printed == "<class 'os.PathLike'>"
+
+
 class _GcProbe:
     pass
 
@@ -2879,7 +3004,10 @@ def test_typed_json_loads_reads_as_from_plain_of_json_loads(
         assert (
             _read_outcome(
                 lambda: wire.json_loads(
-                    text, target, strict=strict, allow_imports=True
+                    text,
+                    target,
+                    strict=strict,
+                    allow_imports=True,
                 ),
             )
             == expected

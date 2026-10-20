@@ -16,10 +16,8 @@ use crate::py::*;
 use crate::sync;
 
 unsafe extern "C" {
-    pub fn _PyType_Lookup(
-        kind: *mut ffi::PyTypeObject,
-        name: *mut ffi::PyObject,
-    ) -> *mut ffi::PyObject;
+    fn _PyType_Lookup(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject)
+    -> *mut ffi::PyObject;
 }
 
 // ------------------------------------------------------------------ stamps --
@@ -215,28 +213,31 @@ pub struct Layout {
     /// Each slot's offset in the instance where ``getattr`` would only read
     /// it, in ``names`` order.
     pub offsets: Box<[Option<isize>]>,
-    /// When each slot has an offset, no slot name is a tag, and instances
-    /// carry no ``__dict__``: the members are then exactly the slots, in order.
-    pub direct: bool,
-    /// Whether the class has no slots, generic lookup, and the plain
-    /// ``__dict__`` descriptor, so ``getattr(instance, "__dict__")`` is the
-    /// instance dict that generic lookup reads members from.
-    pub dict_plain: bool,
-    /// Whether an offset holds only a set slot: an unset one is still read
-    /// by ``getattr``, which calls the class's ``__getattr__``.
-    pub hooked: bool,
-    /// Whether every slot has an offset, so reading members runs no code.
-    pub all_slots: bool,
-    /// Whether ``getattr(instance, "__dict__", None)`` is ``None`` without
-    /// running any code.
-    pub no_dict: bool,
-    /// Whether every slot name is an exact str other than ``py/object``.
-    pub clean: bool,
-    /// Each slot name as JSON text, quoted, where it is ASCII that needs no
-    /// escape and so reads the same under every ``Style``.
+    /// How ``getattr`` finds an instance's members.
+    pub reading: Reading,
+    /// Under ``Reading::Slots``, each slot name as JSON text, quoted, where
+    /// it is ASCII that needs no escape and so reads the same under every
+    /// ``Style``.
     pub key_texts: Vec<Option<Box<[u8]>>>,
-    /// How the last instance dict read under ``dict_plain`` was named.
+    /// Under ``Reading::Dict``, how the last instance dict read was named.
     pub dict_keys: std::cell::RefCell<Option<Rc<DictKeys>>>,
+}
+
+/// How ``getattr`` finds the members of a class's instances.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reading {
+    /// Generic lookup and no instance dict, every slot an object member
+    /// named by an exact str other than ``py/object``: the members are
+    /// exactly the slots, each read at its offset, with no code run.
+    Slots,
+    /// Generic lookup, no slots, and the plain ``__dict__`` descriptor: the
+    /// members are the instance dict's entries (``dict_read``).
+    Dict,
+    /// ``object.__getattribute__`` behind a ``__getattr__``: a set slot is
+    /// read at its offset, an unset one by ``getattr``, which calls the hook.
+    Hooked,
+    /// Each member by ``getattr``, a slot with an offset read there.
+    Generic,
 }
 
 /// What an instance dict's key sequence implies for its members, checked
@@ -246,10 +247,9 @@ pub struct Layout {
 pub struct DictKeys {
     /// The keys in insertion order, matched by identity.
     pub keys: Vec<Py<PyAny>>,
-    /// The insertion index of each member in ``attribute_names`` order.
-    pub order: Vec<u8>,
-    /// Each member's name as JSON text, by output position.
-    pub texts: Vec<Option<Box<[u8]>>>,
+    /// Each member in ``attribute_names`` order: its key's index in ``keys``,
+    /// and its name as JSON text where ``plain_key_text`` gives one.
+    pub members: Vec<(u8, Option<Box<[u8]>>)>,
 }
 
 /// ``_PyType_Lookup``: the first of the MRO's dicts holding ``name``. Read
@@ -336,47 +336,49 @@ impl Layout {
         })
     }
 
+    /// The layout of slots ``names`` at ``offsets``, read as ``reading``
+    /// says. ``Reading::Slots`` asks only for generic lookup and no instance
+    /// dict; it is kept where every slot has an offset and a plain key for a
+    /// name, else the slots are read generically.
     pub fn new(
-        py: Python<'_>,
         stamp: Stamp,
-        slots: Vec<(B<'_>, Option<isize>)>,
-        direct: bool,
-    ) -> PyResult<Self> {
-        let (names, offsets): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
-        Ok(Self {
+        names: Bound<'_, PyTuple>,
+        offsets: Box<[Option<isize>]>,
+        reading: Reading,
+    ) -> Self {
+        let exact = || {
+            offsets.iter().all(Option::is_some)
+                && names
+                    .iter()
+                    .all(|name| unsafe { crate::encode::plain_key_raw(name.as_ptr()) })
+        };
+        let reading = match reading {
+            Reading::Slots if !exact() => Reading::Generic,
+            reading => reading,
+        };
+        let key_texts = match reading {
+            Reading::Slots => names
+                .iter()
+                .map(|name| crate::json::plain_key_text(&name))
+                .collect(),
+            _ => Vec::new(),
+        };
+        Self {
             stamp,
-            names: PyTuple::new(py, names)?.unbind(),
-            offsets: offsets.into_boxed_slice(),
-            direct,
-            dict_plain: false,
-            hooked: false,
-            all_slots: false,
-            no_dict: false,
-            clean: false,
-            key_texts: Vec::new(),
+            names: names.unbind(),
+            offsets,
+            reading,
+            key_texts,
             dict_keys: std::cell::RefCell::new(None),
         }
-        .finished(py))
     }
+}
 
-    /// The text-walk facts that follow from the names and offsets: whether
-    /// every slot has an offset and a clean name, and each name's text.
-    pub fn finished(mut self, py: Python<'_>) -> Self {
-        let names = self.names.bind(py);
-        self.all_slots = !self.hooked && self.offsets.iter().all(Option::is_some);
-        self.clean = names.iter().all(|name| {
-            tp(&name) == t_str() && utf8(&name).is_some_and(|text| text != b"py/object")
-        });
-        self.key_texts = names
-            .iter()
-            .map(|name| {
-                (tp(&name) == t_str())
-                    .then(|| crate::json::plain_key_text(&name))
-                    .flatten()
-            })
-            .collect();
-        self
-    }
+/// Whether an object node can take ``name`` as a key built at the end: an
+/// exact str, whose hash and equality run no code, other than ``py/object``.
+#[inline]
+pub fn is_clean_name(name: &B<'_>) -> bool {
+    tp(name) == t_str() && utf8(name).is_some_and(|text| text != b"py/object")
 }
 
 pub const PY_AUDIT_READ: std::ffi::c_int = 2;
@@ -525,8 +527,8 @@ pub fn object_new(kind: &B<'_>) -> Option<ffi::newfunc> {
         let new = (*base).tp_new?;
         let plain = ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
             && (*class).tp_new.map(|f| f as usize) == Some(new as usize)
-            && !_PyType_Lookup(class, name).is_null()
-            && _PyType_Lookup(class, name) == _PyType_Lookup(base, name);
+            && !type_lookup(class, name).is_null()
+            && type_lookup(class, name) == type_lookup(base, name);
         plain.then_some(new)
     }
 }
@@ -732,22 +734,7 @@ pub unsafe fn layout_from(
     unsafe {
         let names = Bound::from_borrowed_ptr(py, read.names).cast_into_unchecked::<PyTuple>();
         if sort {
-            return Some(
-                Layout {
-                    stamp,
-                    names: names.unbind(),
-                    offsets: offsets.into(),
-                    direct: true,
-                    dict_plain: false,
-                    hooked: false,
-                    all_slots: false,
-                    no_dict: true,
-                    clean: false,
-                    key_texts: Vec::new(),
-                    dict_keys: std::cell::RefCell::new(None),
-                }
-                .finished(py),
-            );
+            return Some(Layout::new(stamp, names, offsets.into(), Reading::Slots));
         }
         // ``__slots__``' order: each name is one ``ht_slots`` holds, or the
         // ``__weakref__`` slot, which carries no state.
@@ -762,22 +749,12 @@ pub unsafe fn layout_from(
             order.push(name);
             kept.push(offsets[at]);
         }
-        Some(
-            Layout {
-                stamp,
-                names: PyTuple::new(py, order).ok()?.unbind(),
-                offsets: kept.into_boxed_slice(),
-                direct: true,
-                dict_plain: false,
-                hooked: false,
-                all_slots: false,
-                no_dict: true,
-                clean: false,
-                key_texts: Vec::new(),
-                dict_keys: std::cell::RefCell::new(None),
-            }
-            .finished(py),
-        )
+        Some(Layout::new(
+            stamp,
+            PyTuple::new(py, order).ok()?,
+            kept.into_boxed_slice(),
+            Reading::Slots,
+        ))
     }
 }
 
@@ -916,7 +893,7 @@ pub fn native_import_path_in<'py>(
             module_dict(&walked).get_item(*part)?
         } else if ob_type(walked.as_ptr()) == &raw mut ffi::PyType_Type {
             let name = PyString::new(py, part);
-            let found = unsafe { _PyType_Lookup(walked.as_ptr().cast(), name.as_ptr()) };
+            let found = unsafe { type_lookup(walked.as_ptr().cast(), name.as_ptr()) };
             // A descriptor found there could answer ``getattr`` itself.
             if found.is_null() {
                 return Ok(None);

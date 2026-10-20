@@ -420,24 +420,19 @@ impl FieldSlots {
         Ok(Some(views))
     }
 
-    /// The attribute at ``offset`` of a field ``fields`` returned, or its
-    /// ``getattr`` where the slot is unset or ``Field`` changed since.
+    /// ``field``'s attribute at ``offset``, or its ``getattr`` where
+    /// ``field`` is not a ``Field``, the slot is unset, or ``Field`` changed.
     #[inline]
-    fn get<'py>(
-        &self,
-        view: &FieldView<'py>,
-        offset: ffi::Py_ssize_t,
-        name: &str,
-    ) -> PyResult<B<'py>> {
-        let py = view.field.py();
+    fn get<'py>(&self, field: &B<'py>, offset: ffi::Py_ssize_t, name: &str) -> PyResult<B<'py>> {
+        let py = field.py();
         let kind = self.field.bind(py).as_ptr().cast::<ffi::PyTypeObject>();
         if unsafe { (*kind).tp_version_tag } == self.tag
-            && tp(&view.field) == kind
-            && let Some(found) = unsafe { Self::read(py, view.field.as_ptr(), offset) }
+            && tp(field) == kind
+            && let Some(found) = unsafe { Self::read(py, field.as_ptr(), offset) }
         {
             return Ok(found);
         }
-        view.field.getattr(name)
+        field.getattr(name)
     }
 
     /// ``dataclasses._FIELD``, the ``_field_type`` of a regular field.
@@ -447,28 +442,22 @@ impl FieldSlots {
 
     /// ``field._field_type`` for any object ``field``.
     pub fn field_type<'py>(&self, field: &B<'py>) -> PyResult<B<'py>> {
-        self.get(
-            &FieldView {
-                field: field.clone(),
-            },
-            self.field_type,
-            "_field_type",
-        )
+        self.get(field, self.field_type, "_field_type")
     }
 
     pub fn name<'py>(&self, view: &FieldView<'py>) -> PyResult<B<'py>> {
-        self.get(view, self.name, "name")
+        self.get(&view.field, self.name, "name")
     }
 
     pub fn default<'py>(&self, view: &FieldView<'py>) -> PyResult<B<'py>> {
-        self.get(view, self.default, "default")
+        self.get(&view.field, self.default, "default")
     }
 
     pub fn factory<'py>(&self, view: &FieldView<'py>) -> PyResult<B<'py>> {
-        self.get(view, self.factory, "default_factory")
+        self.get(&view.field, self.factory, "default_factory")
     }
 
     pub fn init<'py>(&self, view: &FieldView<'py>) -> PyResult<B<'py>> {
-        self.get(view, self.init, "init")
+        self.get(&view.field, self.init, "init")
     }
 }

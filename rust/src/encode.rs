@@ -339,7 +339,7 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         PyDict::new(py),
     ))?;
     let dict_getter = unsafe {
-        let found = _PyType_Lookup(dict_probe.as_ptr().cast(), intern!(py, "__dict__").as_ptr());
+        let found = type_lookup(dict_probe.as_ptr().cast(), intern!(py, "__dict__").as_ptr());
         (!found.is_null() && ffi::Py_TYPE(found) == &raw mut ffi::PyGetSetDescr_Type)
             .then(|| (*(*found.cast::<ffi::PyGetSetDescrObject>()).d_getset).get)
             .flatten()
@@ -595,8 +595,8 @@ impl Env {
     }
 }
 
-/// The instance dict ``dict_read`` read, kept for its borrowed members, and
-/// how its keys name them.
+/// The instance dict ``dict_read`` read, which holds the members it lent
+/// out, and how its keys name them.
 type DictRead<'py> = (B<'py>, Rc<DictKeys>);
 
 /// A class's layout and the sort it answers, where the sort is known
@@ -611,7 +611,7 @@ const DICT_LIMIT: usize = 64;
 /// type is no data descriptor.
 fn unshadowed(kind: *mut ffi::PyTypeObject, name: *mut ffi::PyObject) -> bool {
     unsafe {
-        let found = _PyType_Lookup(kind, name);
+        let found = type_lookup(kind, name);
         if found.is_null() {
             return true;
         }
@@ -629,7 +629,7 @@ fn plain_dict_attr(kind: *mut ffi::PyTypeObject, dict_name: &B<'_>, getter: Opti
         return false;
     };
     unsafe {
-        let found = _PyType_Lookup(kind, dict_name.as_ptr());
+        let found = type_lookup(kind, dict_name.as_ptr());
         if found.is_null() || ffi::Py_TYPE(found) != &raw mut ffi::PyGetSetDescr_Type {
             return false;
         }
@@ -650,11 +650,14 @@ fn plain_dict_attr(kind: *mut ffi::PyTypeObject, dict_name: &B<'_>, getter: Opti
     }
 }
 
-/// Whether an object node can take ``name`` as a key built at the end: an
-/// exact str, whose hash and equality run no code, other than ``py/object``.
-#[inline]
-fn is_clean_name(name: &B<'_>) -> bool {
-    tp(name) == t_str() && utf8(name).is_some_and(|text| text != b"py/object")
+/// An object node holding only its ``py/object`` tag, sized for ``members``.
+fn object_node<'py>(py: Python<'py>, path: B<'py>, members: usize) -> PyResult<Bound<'py, PyDict>> {
+    let node = unsafe {
+        Bound::from_owned_ptr_or_err(py, _PyDict_NewPresized(members as ffi::Py_ssize_t + 1))?
+            .cast_into_unchecked::<PyDict>()
+    };
+    node.set_item(intern!(py, "py/object"), path)?;
+    Ok(node)
 }
 
 /// Read a slot at ``offset``, as ``getattr`` would: ``None`` when unset.
@@ -770,7 +773,7 @@ fn is_plain_key(key: &B<'_>) -> PyResult<bool> {
 /// # Safety
 /// ``key`` is a live object.
 #[inline(always)]
-unsafe fn plain_key_raw(key: *mut ffi::PyObject) -> bool {
+pub unsafe fn plain_key_raw(key: *mut ffi::PyObject) -> bool {
     unsafe {
         if ob_type(key) != t_str() {
             return false;
@@ -1505,15 +1508,17 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let pre = match self.sort {
             Flag::Known(sort) if self.env.names_own => info.layouts[usize::from(sort)]
                 .clone()
+                .filter(|layout| layout.stamp.holds(kind))
                 .map(|layout| (layout, sort)),
             _ => None,
         };
         Ok(Some((path, pre)))
     }
 
-    /// The layout of a ``dict_plain`` class whose stamp holds, and the sort
-    /// it is for, where the sort is known without asking.
-    fn dict_layout(&mut self, kind: &B<'py>) -> PyResult<Option<SortLayout>> {
+    /// ``layout(kind, sort)`` and the sort, while its stamp holds, where the
+    /// sort is known without asking: the first call ``object_members`` makes,
+    /// made early.
+    fn known_layout(&mut self, kind: &B<'py>) -> PyResult<Option<SortLayout>> {
         let Flag::Known(sort) = self.sort else {
             return Ok(None);
         };
@@ -1522,7 +1527,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         }
         Ok(self
             .layout(kind, sort)?
-            .filter(|layout| layout.dict_plain && layout.stamp.holds(kind))
+            .filter(|layout| layout.stamp.holds(kind))
             .map(|layout| (layout, sort)))
     }
 
@@ -1546,7 +1551,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
             let layout = info.layouts[usize::from(sort)].as_ref()?;
             match (&info.encoder, &info.path) {
                 (Some(Kept::Native(Nat::Object)), Some(path))
-                    if layout.direct || layout.dict_plain =>
+                    if matches!(layout.reading, Reading::Slots | Reading::Dict) =>
                 {
                     Some((path.bind(py).clone(), layout.clone()))
                 }
@@ -1566,8 +1571,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
         self.object_fast(value, kind, path, &layout, sort, frame, true)
     }
 
-    /// ``encode_object`` read from ``layout``: a ``direct`` class's slots, or
-    /// a ``dict_plain`` instance's dict by ``dict_read``. ``None``, with nothing
+    /// ``encode_object`` read from ``layout``: a ``Reading::Slots`` class's
+    /// slots, or a ``Reading::Dict`` instance's dict by ``dict_read``. ``None``, with nothing
     /// registered, where neither applies. ``register`` registers ``value``
     /// once the read is certain, for a caller that has not.
     #[allow(clippy::too_many_arguments)]
@@ -1581,13 +1586,13 @@ impl<'py, 'g> Encoder<'py, 'g> {
         frame: u32,
         register: bool,
     ) -> PyResult<Option<B<'py>>> {
-        if layout.direct {
+        if layout.reading == Reading::Slots {
             if register {
                 self.register(value, frame);
             }
             return self.direct_object(value, path, layout, frame).map(Some);
         }
-        if !(layout.dict_plain && layout.stamp.holds(kind)) {
+        if !(layout.reading == Reading::Dict && layout.stamp.holds(kind)) {
             return Ok(None);
         }
         let mut found = [std::ptr::null_mut(); DICT_LIMIT];
@@ -1957,7 +1962,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         // set slot generically, and calls ``__getattr__`` only for an unset one.
         let hooked = !generic
             && unsafe { (*class).tp_getattro }.map(|f| f as usize) == self.g.getattr_hook
-            && unsafe { _PyType_Lookup(class, intern!(self.py, "__getattribute__").as_ptr()) }
+            && unsafe { type_lookup(class, intern!(self.py, "__getattribute__").as_ptr()) }
                 == self.g.object_getattribute.as_ptr();
         let slots: Vec<(B<'py>, Option<isize>)> = slots
             .into_iter()
@@ -1969,29 +1974,27 @@ impl<'py, 'g> Encoder<'py, 'g> {
             })
             .collect();
         let py = self.py;
-        let dictless = generic && dictless(class, py);
-        let direct = dictless
-            && slots.iter().all(|(name, offset)| {
-                offset.is_some()
-                    && tp(name) == t_str()
-                    && utf8(name).is_some_and(|text| {
-                        !text.starts_with(b"py/") && !text.starts_with(b"json://")
-                    })
-            });
-        let dict_plain = slots.is_empty()
-            && generic
-            && plain_dict_attr(class, intern!(py, "__dict__").as_any(), self.g.dict_getter);
-        let mut layout = Layout::new(py, Stamp::always(kind), slots, direct)?;
-        layout.dict_plain = dict_plain;
-        layout.hooked = hooked;
-        // A class with ``__getattr__`` keeps ``no_dict`` false: Python's
-        // ``getattr(obj, "__dict__", None)`` calls it, and what it returns is
-        // part of the output.
-        layout.no_dict = generic
-            && dictless
-            && unsafe { _PyType_Lookup(class, intern!(py, "__getattr__").as_ptr()) }.is_null();
-        let layout = layout.finished(py);
-        let layout = Rc::new(layout);
+        // A ``__getattr__`` makes lookup other than generic, so a generic
+        // class's ``getattr(obj, "__dict__", None)`` runs no code.
+        let reading = if hooked {
+            Reading::Hooked
+        } else if generic && dictless(class, py) {
+            Reading::Slots
+        } else if generic
+            && slots.is_empty()
+            && plain_dict_attr(class, intern!(py, "__dict__").as_any(), self.g.dict_getter)
+        {
+            Reading::Dict
+        } else {
+            Reading::Generic
+        };
+        let (names, offsets): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
+        let layout = Rc::new(Layout::new(
+            Stamp::always(kind),
+            PyTuple::new(py, names)?,
+            offsets.into_boxed_slice(),
+            reading,
+        ));
         if let Some(info) = self.keep(kind, now, before) {
             info.layouts[usize::from(sort)] = Some(layout.clone());
         }
@@ -2017,7 +2020,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let subtype = |base: &Py<PyAny>| unsafe {
             ffi::PyType_IsSubtype(class, base.as_ptr().cast::<ffi::PyTypeObject>()) != 0
         };
-        let lookup = |name: &Bound<'py, PyString>| unsafe { _PyType_Lookup(class, name.as_ptr()) };
+        let lookup = |name: &Bound<'py, PyString>| unsafe { type_lookup(class, name.as_ptr()) };
         let fast = subtype(&self.g.enum_type)
             && !subtype(&self.g.pure_path)
             && !subtype(&self.g.partial)
@@ -2355,10 +2358,25 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
         }
         self.register(value, frame);
-        let node = unsafe { Bound::from_owned_ptr_or_err(py, ffi::PyDict_Copy(source))? };
+        let node = unsafe {
+            Bound::from_owned_ptr_or_err(py, ffi::PyDict_Copy(source))?
+                .cast_into_unchecked::<PyDict>()
+        };
+        self.own_parts(&node, frame)?;
+        Ok(Some(node.into_any()))
+    }
+
+    /// ``_push_values`` for a node this walk alone holds, every key an exact
+    /// str: each value, as ``part`` takes it. The node already holds every
+    /// member, read before any is encoded, so code an encoding runs cannot
+    /// change or free what is still to come.
+    fn own_parts(&mut self, node: &Bound<'py, PyDict>, frame: u32) -> PyResult<()> {
+        let py = self.py;
         let base = self.stack.len();
-        // ``node`` is this walk's own dict, which no other code sees: setting
-        // a key it holds never resizes it, so its iteration stays valid.
+        let shared = node.as_any();
+        let (mut key, mut item) = (std::ptr::null_mut(), std::ptr::null_mut());
+        // No other code sees ``node``, and setting a key it holds never
+        // resizes it, so its iteration stays valid.
         let mut position: ffi::Py_ssize_t = 0;
         while unsafe { ffi::PyDict_Next(node.as_ptr(), &mut position, &mut key, &mut item) } != 0 {
             if unsafe { self.plain_raw(item) } {
@@ -2366,10 +2384,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
             let part = unsafe { Bound::from_borrowed_ptr(py, item) };
             let key = unsafe { Bound::from_borrowed_ptr(py, key) };
-            self.part(&node, Slot::Key(key), part, frame)?;
+            self.part(shared, Slot::Key(key), part, frame)?;
         }
         self.queued(base);
-        Ok(Some(node))
+        Ok(())
     }
 
     fn encode_dict(&mut self, value: &B<'py>, frame: u32) -> PyResult<B<'py>> {
@@ -2484,55 +2502,46 @@ impl<'py, 'g> Encoder<'py, 'g> {
         Ok(node.into_any())
     }
 
-    /// ``encode_object``'s node for a ``dict_plain`` instance whose members
-    /// ``dict_read`` read into ``found``: a presized dict, its parts taken in
-    /// order as ``direct_slots`` takes them.
+    /// ``encode_object``'s node for a ``Reading::Dict`` instance whose
+    /// members ``dict_read`` read into ``found``: a presized dict holding
+    /// every member, then its parts taken as ``own_parts`` takes them.
     fn dict_object(
         &mut self,
         path: B<'py>,
-        order: &DictKeys,
+        keys: &DictKeys,
         found: &[*mut ffi::PyObject; DICT_LIMIT],
         frame: u32,
     ) -> PyResult<B<'py>> {
         let py = self.py;
         let pending = self.g.pending.as_ptr();
-        let node = unsafe {
-            Bound::from_owned_ptr_or_err(
-                py,
-                _PyDict_NewPresized(order.order.len() as ffi::Py_ssize_t + 1),
-            )?
-            .cast_into_unchecked::<PyDict>()
-        };
-        node.set_item(intern!(py, "py/object"), path)?;
-        let base = self.stack.len();
-        let shared = node.as_any();
-        for &index in &order.order {
+        let node = object_node(py, path, keys.members.len())?;
+        let mut parts = false;
+        // The caller holds the instance dict, which holds each member until
+        // the node does; no code runs between.
+        for &(index, _) in &keys.members {
             let member = found[index as usize];
             if member == pending {
                 continue;
             }
-            let name = order.keys[index as usize].as_ptr();
+            let name = keys.keys[index as usize].as_ptr();
             if unsafe { ffi::PyDict_SetItem(node.as_ptr(), name, member) } < 0 {
                 return Err(PyErr::fetch(py));
             }
-            if unsafe { self.plain_raw(member) } {
-                continue;
-            }
-            // The order holds its names, and the instance dict, held by the
-            // caller, its members while no Python code runs.
-            let key = unsafe { Bound::from_borrowed_ptr(py, name) };
-            let member = unsafe { Bound::from_borrowed_ptr(py, member) };
-            self.part(shared, Slot::Key(key), member, frame)?;
+            parts = parts || !unsafe { self.plain_raw(member) };
         }
-        self.queued(base);
+        if parts {
+            self.own_parts(&node, frame)?;
+        }
         Ok(node.into_any())
     }
 
     // Perf: rows to_plain, lockstep: flat and frozen ~1.5x (from 78512ab).
-    /// ``attribute_names`` and ``getattr`` for an instance of a ``dict_plain``
-    /// class whose stamp holds, read from its dict with no code run: the dict
-    /// (kept for the borrowed values) and its ``DictKeys``, with ``found``
-    /// filled in insertion order. ``None`` where a key or the dict is not one
+    /// ``attribute_names`` and ``getattr`` for an instance of a
+    /// ``Reading::Dict`` class whose stamp holds, read from its dict with no
+    /// code run: the dict and its ``DictKeys``, with ``found`` filled in
+    /// insertion order. ``found`` is borrowed from the dict, which holds its
+    /// members only until code runs: a caller takes its own reference to
+    /// each before running any. ``None`` where a key or the dict is not one
     /// that reads so, for the generic reading to take over.
     fn dict_read(
         &self,
@@ -2569,15 +2578,15 @@ impl<'py, 'g> Encoder<'py, 'g> {
         }
         let keys = &keys[..at];
         let cached = layout.dict_keys.borrow().clone();
-        if let Some(order) = cached
-            && order.keys.len() == keys.len()
-            && order
+        if let Some(known) = cached
+            && known.keys.len() == keys.len()
+            && known
                 .keys
                 .iter()
                 .zip(keys)
                 .all(|(each, &key)| each.as_ptr() == key)
         {
-            return Ok(Some((dict, order)));
+            return Ok(Some((dict, known)));
         }
         let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
         let mut names = Vec::with_capacity(keys.len());
@@ -2594,17 +2603,16 @@ impl<'py, 'g> Encoder<'py, 'g> {
             // orders exact strs.
             order.sort_by(|&a, &b| utf8(&names[a as usize]).cmp(&utf8(&names[b as usize])));
         }
-        let texts = order
-            .iter()
-            .map(|&index| json::plain_key_text(&names[index as usize]))
+        let members = order
+            .into_iter()
+            .map(|index| (index, json::plain_key_text(&names[index as usize])))
             .collect();
-        let order = Rc::new(DictKeys {
+        let keys = Rc::new(DictKeys {
             keys: names.into_iter().map(Bound::unbind).collect(),
-            order,
-            texts,
+            members,
         });
-        layout.dict_keys.replace(Some(order.clone()));
-        Ok(Some((dict, order)))
+        layout.dict_keys.replace(Some(keys.clone()));
+        Ok(Some((dict, keys)))
     }
 
     /// ``encode_object`` for an instance whose members are exactly its
@@ -2632,15 +2640,11 @@ impl<'py, 'g> Encoder<'py, 'g> {
         frame: u32,
     ) -> PyResult<B<'py>> {
         let py = self.py;
-        let size = offsets.len() + 1;
-        let node = unsafe {
-            Bound::from_owned_ptr_or_err(py, _PyDict_NewPresized(size as ffi::Py_ssize_t))?
-                .cast_into_unchecked::<PyDict>()
-        };
-        node.set_item(intern!(py, "py/object"), path)?;
+        let node = object_node(py, path, offsets.len())?;
         let pending = self.g.pending.as_ptr();
-        let base = self.stack.len();
-        let shared = node.as_any();
+        let mut parts = false;
+        // The walk holds the instance, which holds each member until the
+        // node does; no code runs between.
         for (index, offset) in offsets.iter().enumerate() {
             let Some(offset) = offset else {
                 continue;
@@ -2655,20 +2659,15 @@ impl<'py, 'g> Encoder<'py, 'g> {
             if member.is_null() || member == pending {
                 continue;
             }
-            // The layout holds its names, and the walk holds the instance,
-            // which holds the member while no Python code runs.
             let name = unsafe { ffi::PyTuple_GET_ITEM(names, index as ffi::Py_ssize_t) };
             if unsafe { ffi::PyDict_SetItem(node.as_ptr(), name, member) } < 0 {
                 return Err(PyErr::fetch(py));
             }
-            if unsafe { self.plain_raw(member) } {
-                continue;
-            }
-            let key = unsafe { Bound::from_borrowed_ptr(py, name) };
-            let member = unsafe { Bound::from_borrowed_ptr(py, member) };
-            self.part(shared, Slot::Key(key), member, frame)?;
+            parts = parts || !unsafe { self.plain_raw(member) };
         }
-        self.queued(base);
+        if parts {
+            self.own_parts(&node, frame)?;
+        }
         Ok(node.into_any())
     }
 
@@ -2700,6 +2699,23 @@ impl<'py, 'g> Encoder<'py, 'g> {
             }
             return Ok(members);
         };
+        if layout.reading == Reading::Dict && layout.stamp.holds(kind) {
+            let mut found = [std::ptr::null_mut(); DICT_LIMIT];
+            if let Some((_dict, keys)) = self.dict_read(value, kind, &layout, sort, &mut found)? {
+                let pending = self.g.pending.as_ptr();
+                return Ok(keys
+                    .members
+                    .iter()
+                    .filter(|&&(index, _)| found[index as usize] != pending)
+                    .map(|&(index, _)| unsafe {
+                        (
+                            keys.keys[index as usize].bind(py).clone(),
+                            B::from_borrowed_ptr(py, found[index as usize]),
+                        )
+                    })
+                    .collect());
+            }
+        }
         // ``attribute_names``' own reading of the instance: its ``__dict__``
         // keys that are not slots, after the slots, sorted together if asked.
         let mut extra = Vec::new();
@@ -2712,23 +2728,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
         } else {
             optional_attr(value, intern!(py, "__dict__").as_any())?
         };
-        if layout.dict_plain && layout.stamp.holds(kind) {
-            let mut found = [std::ptr::null_mut(); DICT_LIMIT];
-            if let Some((_dict, order)) = self.dict_read(value, kind, &layout, sort, &mut found)? {
-                let pending = self.g.pending.as_ptr();
-                return Ok(order
-                    .order
-                    .iter()
-                    .filter(|&&index| found[index as usize] != pending)
-                    .map(|&index| unsafe {
-                        (
-                            order.keys[index as usize].bind(py).clone(),
-                            B::from_borrowed_ptr(py, found[index as usize]),
-                        )
-                    })
-                    .collect());
-            }
-        }
         if let Some(state) = state
             && state.is_truthy()?
         {
@@ -2790,7 +2789,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let offset = held.and_then(|(layout, index)| layout.offsets[index]);
         let found = match offset {
             Some(offset) => match read_slot(value, offset) {
-                None if held.is_some_and(|(layout, _)| layout.hooked) => {
+                None if held.is_some_and(|(layout, _)| layout.reading == Reading::Hooked) => {
                     optional_attr(value, name)?
                 }
                 found => found,
@@ -2850,8 +2849,9 @@ impl<'py, 'g> Encoder<'py, 'g> {
     }
 
     /// Whether ``kind``'s ``__reduce_ex__(2)`` is ``object``'s own calling a
-    /// custom ``__reduce__``, with no instance dict to shadow either, so the
-    /// recipe can be read without Python's ``_canonical_reduce``.
+    /// custom ``__reduce__``, with no instance dict to shadow either and a
+    /// plain ``type`` metaclass, through which ``object.__reduce_ex__`` reads
+    /// it, so the recipe can be read without Python's ``_canonical_reduce``.
     fn own_reduce(&mut self, kind: &B<'py>) -> PyResult<bool> {
         let now = self.current()?;
         if !self.env.reduce_own {
@@ -2865,7 +2865,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let before = Stamp::always(kind);
         let py = self.py;
         let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-        let lookup = |name: &Bound<'py, PyString>| unsafe { _PyType_Lookup(class, name.as_ptr()) };
+        let lookup = |name: &Bound<'py, PyString>| unsafe { type_lookup(class, name.as_ptr()) };
         let reduce = lookup(intern!(py, "__reduce__"));
         // Only a plain function, or an attribute with no ``__get__``, binds
         // with no code run. Anything else (a property, say) may raise on
@@ -2876,7 +2876,8 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 let kind = ob_type(reduce);
                 kind == &raw mut ffi::PyFunction_Type || (*kind).tp_descr_get.is_none()
             };
-        let own = generic_getattr(class)
+        let own = ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
+            && generic_getattr(class)
             && unsafe { (*class).tp_dictoffset == 0 }
             && unsafe { ffi::PyType_HasFeature(class, ffi::Py_TPFLAGS_MANAGED_DICT) == 0 }
             && lookup(intern!(py, "__reduce_ex__")) == self.g.object_reduce_ex.as_ptr()
@@ -2897,7 +2898,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         }
         let py = self.py;
         let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-        let found = unsafe { _PyType_Lookup(class, intern!(py, "__reduce__").as_ptr()) };
+        let found = unsafe { type_lookup(class, intern!(py, "__reduce__").as_ptr()) };
         // ``_PyObject_LookupSpecial`` binds what it finds, as lookup does.
         let callable = unsafe {
             match (*ob_type(found)).tp_descr_get {
@@ -3023,10 +3024,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
             return Ok(Recipe::Unreduced);
         };
         if is_str(&recipe) {
-            if let Some(path) = self.global_path(value, &recipe)? {
+            let module = kind.getattr(intern!(py, "__module__"))?;
+            if let Some(path) = self.global_path(value, &module, &recipe)? {
                 return Ok(Recipe::Path(path));
             }
-            let module = kind.getattr(intern!(py, "__module__"))?;
             let path = format!("{}.{}", module.str()?.to_cow()?, recipe.str()?.to_cow()?);
             let path = self.env.verified_path.bind(py).call1((path, value))?;
             return Ok(Recipe::Path(path));
@@ -3036,21 +3037,22 @@ impl<'py, 'g> Encoder<'py, 'g> {
         ))
     }
 
-    /// ``_verified_path(f"{type(value).__module__}.{name}", value)`` where it
-    /// reads natively: the module is in ``sys.modules`` as a plain module
-    /// whose own dict holds ``name`` as ``value`` itself, and no longer
-    /// dotted prefix of the path is loaded. ``None`` to ask Python.
-    fn global_path(&self, value: &B<'py>, name: &B<'py>) -> PyResult<Option<B<'py>>> {
+    /// ``_verified_path(f"{module}.{name}", value)`` where it reads natively:
+    /// ``module`` is in ``sys.modules`` as a plain module whose own dict holds
+    /// ``name`` as ``value`` itself, and no longer dotted prefix of the path
+    /// is loaded. ``None`` to ask Python.
+    fn global_path(
+        &self,
+        value: &B<'py>,
+        module: &B<'py>,
+        name: &B<'py>,
+    ) -> PyResult<Option<B<'py>>> {
         let py = self.py;
         if !self.env.helpers_own || tp(name) != t_str() {
             return Ok(None);
         }
-        let kind = value.get_type();
-        let Some(module) = kind.as_any().getattr_opt(intern!(py, "__module__"))? else {
-            return Ok(None);
-        };
         let (Some(module_text), Some(name_text)) = (
-            (tp(&module) == t_str()).then(|| utf8(&module)).flatten(),
+            (tp(module) == t_str()).then(|| utf8(module)).flatten(),
             utf8(name),
         ) else {
             return Ok(None);
@@ -3070,7 +3072,7 @@ impl<'py, 'g> Encoder<'py, 'g> {
         else {
             return Ok(None);
         };
-        let Some(found) = modules.get_item(&module)? else {
+        let Some(found) = modules.get_item(module)? else {
             return Ok(None);
         };
         if !found.get_type().is(self.g.paths.module_type.bind(py)) {
@@ -3665,20 +3667,12 @@ impl<'py> Encoder<'py, '_> {
         if !self.hooks_are_immutable_empty && self.hooks.contains(&kind)? {
             return self.text_hooked(value, &kind, frame);
         }
-        if let Some((path, pre)) = self.cached_object(&kind)? {
+        if let Some((path, known)) = self.cached_object(&kind)? {
             self.register(value, frame);
-            if let Some((layout, sort)) = &pre
-                && layout.stamp.holds(&kind)
-                && tp(&path) == t_str()
+            if let Some((layout, sort)) = known
+                && self.text_known_object(value, &kind, &path, &layout, sort, frame)?
             {
-                if layout.all_slots && layout.no_dict && layout.clean {
-                    return self.text_slots(value, &path, layout, frame);
-                }
-                if layout.dict_plain
-                    && self.text_dict_members(value, &kind, &path, layout, *sort, frame)?
-                {
-                    return Ok(());
-                }
+                return Ok(());
             }
             return self.text_object_rest(value, &kind, path, frame);
         }
@@ -4090,28 +4084,33 @@ impl<'py> Encoder<'py, '_> {
         Ok(())
     }
 
-    /// The layout, already kept, that ``object_members`` would read every
-    /// member of ``kind`` by slot offset with: names exact strs, no instance
-    /// dict. Asks nothing of Python, so a miss leaves ``object_members`` to
-    /// make every call it makes.
-    fn slots_layout(&mut self, kind: &B<'py>) -> PyResult<Option<Rc<Layout>>> {
-        let Flag::Known(sort) = self.sort else {
-            return Ok(None);
-        };
-        let now = self.current()?;
-        if !self.env.names_own {
-            return Ok(None);
+    /// ``text_object``'s members read from ``layout`` with no code run, under
+    /// ``Reading::Slots`` or ``Reading::Dict``: written, and ``true``; else
+    /// ``false``, with nothing written, for ``object_members`` to read.
+    fn text_known_object(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        path: &B<'py>,
+        layout: &Layout,
+        sort: bool,
+        frame: u32,
+    ) -> Text<bool> {
+        if tp(path) != t_str() {
+            return Ok(false);
         }
-        Ok(self
-            .known(kind, now)
-            .and_then(|info| info.layouts[usize::from(sort)].clone())
-            .filter(|layout| layout.all_slots && layout.no_dict && layout.clean))
+        match layout.reading {
+            Reading::Slots => self.text_slots(value, path, layout, frame).map(|()| true),
+            Reading::Dict => self.text_dict_members(value, kind, path, layout, sort, frame),
+            Reading::Hooked | Reading::Generic => Ok(false),
+        }
     }
 
     // Perf: exp000 json_dumps, lockstep: ~1.1x.
-    /// ``text_object`` for a ``slots_layout`` class: leaf members are written
-    /// as they are read, each name from its prepared text; from the first
-    /// other member on, the rest are queued as ``text_object`` queues them.
+    /// ``text_object`` for a ``Reading::Slots`` class: leaf members are
+    /// written as they are read, each name from its prepared text; from the
+    /// first other member on, the rest are queued as ``text_object`` queues
+    /// them.
     fn text_slots(
         &mut self,
         value: &B<'py>,
@@ -4169,7 +4168,7 @@ impl<'py> Encoder<'py, '_> {
     }
 
     // Perf: rows json_dumps, lockstep: flat and frozen ~2.2x.
-    /// ``text_slots`` for a ``dict_plain`` class, members read by
+    /// ``text_slots`` for a ``Reading::Dict`` class, members read by
     /// ``dict_read``; ``false``, with nothing written, where that declines.
     fn text_dict_members(
         &mut self,
@@ -4182,16 +4181,17 @@ impl<'py> Encoder<'py, '_> {
     ) -> Text<bool> {
         let py = self.py;
         let mut found = [std::ptr::null_mut(); DICT_LIMIT];
-        let Some((_dict, order)) = self.dict_read(value, kind, layout, sort, &mut found)? else {
+        let Some((_dict, keys)) = self.dict_read(value, kind, layout, sort, &mut found)? else {
             return Ok(false);
         };
         let pending = self.g.pending.as_ptr();
         self.w.open_tag(b"py/object");
         self.w.str(path);
-        let count = order.order.len();
+        // Writing a leaf runs no code, so the dict, held here, holds each
+        // member until ``text_open`` takes its own reference.
         let mut at = 0;
-        while at < count {
-            let member = found[order.order[at] as usize];
+        while let Some((index, text)) = keys.members.get(at) {
+            let member = found[*index as usize];
             if member == pending {
                 at += 1;
                 continue;
@@ -4202,9 +4202,9 @@ impl<'py> Encoder<'py, '_> {
             }
             let mark = self.w.buf.len();
             self.w.item_sep();
-            match &order.texts[at] {
+            match text {
                 Some(text) => self.w.raw(text),
-                None => self.w.str(order.keys[order.order[at] as usize].bind(py)),
+                None => self.w.str(keys.keys[*index as usize].bind(py)),
             }
             self.w.key_sep();
             if self.text_leaf(&member)? != Leaf::Written {
@@ -4213,16 +4213,16 @@ impl<'py> Encoder<'py, '_> {
             }
             at += 1;
         }
-        if at == count {
+        if at == keys.members.len() {
             self.w.raw(b"}");
             return Ok(true);
         }
         let mut members = self.spare_entries.pop().unwrap_or_default();
-        for &index in &order.order[at..] {
+        for &(index, _) in &keys.members[at..] {
             let member = found[index as usize];
             if member != pending {
                 members.push((
-                    order.keys[index as usize].bind(py).clone(),
+                    keys.keys[index as usize].bind(py).clone(),
                     unsafe { B::from_borrowed_ptr(py, member) },
                     false,
                 ));
@@ -4247,23 +4247,15 @@ impl<'py> Encoder<'py, '_> {
         path: B<'py>,
         frame: u32,
     ) -> Text<()> {
-        let text_path = tp(&path) == t_str();
-        if text_path
-            && let Some(layout) = self.slots_layout(kind)?
-            && layout.stamp.holds(kind)
-        {
-            return self.text_slots(value, &path, &layout, frame);
-        }
-        if text_path
-            && let Some((layout, sort)) = self.dict_layout(kind)?
-            && self.text_dict_members(value, kind, &path, &layout, sort, frame)?
+        if let Some((layout, sort)) = self.known_layout(kind)?
+            && self.text_known_object(value, kind, &path, &layout, sort, frame)?
         {
             return Ok(());
         }
         let members = self.object_members(value, kind)?;
         // A name that is not an exact str other than ``py/object`` changes the
         // dict in ways only its tree shows, so the tree walk builds the node.
-        let clean = text_path && members.iter().all(|(name, _)| is_clean_name(name));
+        let clean = tp(&path) == t_str() && members.iter().all(|(name, _)| is_clean_name(name));
         if !clean {
             let py = self.py;
             let base = self.stack.len();

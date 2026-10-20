@@ -22,8 +22,7 @@ use pyo3::types::{
 
 use crate::attrs::{FieldSlots, HasTable, SetTable};
 use crate::class::{
-    _PyType_Lookup, Stamp, member_of, object_new, own_namespace, store_offsets, type_lookup,
-    version_tag,
+    Stamp, member_of, object_new, own_namespace, store_offsets, type_lookup, version_tag,
 };
 use crate::errors::*;
 use crate::places::{Loc, Paths, PlacedTable, ROOT, Spare, StepRef};
@@ -2281,12 +2280,10 @@ impl<'py, 'g> Decoder<'py, 'g> {
         };
         // A compiled program reads the whole document faster still; it runs
         // no Python code, so trying it first changes nothing the quick loops
-        // or the walk would see.
-        // ``object`` is left to the tag scan, which returns an untagged tree
-        // itself rather than a copy.
-        if !plan.is_object
-            && matches!(&*plan.program.borrow(), Compiled::Yes(_))
-            && let Some(value) = self.run_program(data, target, &plan)
+        // or the walk would see. The tag scan has not run, so an ``object``
+        // part that is a container leaves the document to it.
+        if matches!(&*plan.program.borrow(), Compiled::Yes(_))
+            && let Some(value) = self.run_program(data, target, &plan, None)
         {
             return Ok(Some(value));
         }
@@ -2315,7 +2312,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
         let persistent =
             kind.is(self.b(&self.g.union_type)) || kind.is(self.b(&self.g.generic_alias));
         let plan = self.plan_for(target, persistent)?;
-        if let Some(value) = self.run_program(data, target, &plan) {
+        if let Some(value) = self.run_program(data, target, &plan, Some(self.untagged)) {
             return Ok(value);
         }
         self.walk(data, target, &plan, Loc::At(ROOT))
@@ -3510,11 +3507,10 @@ impl<'py, 'g> Decoder<'py, 'g> {
     fn is_instance(&self, value: &B<'py>, origin: &B<'py>) -> PyResult<bool> {
         if is_class(origin) {
             let meta = ob_type(origin.as_ptr());
-            let check = unsafe {
-                _PyType_Lookup(meta, pyo3::intern!(self.py, "__instancecheck__").as_ptr())
-            };
+            let check =
+                unsafe { type_lookup(meta, pyo3::intern!(self.py, "__instancecheck__").as_ptr()) };
             let own = unsafe {
-                _PyType_Lookup(
+                type_lookup(
                     &raw mut ffi::PyType_Type,
                     pyo3::intern!(self.py, "__instancecheck__").as_ptr(),
                 )
@@ -5445,11 +5441,11 @@ impl<'py, 'g> Decoder<'py, 'g> {
             let meta = ob_type(target.as_ptr());
             let type_getattro = ffi::PyType_Type.tp_getattro.map(|f| f as usize);
             if (*meta).tp_getattro.map(|f| f as usize) != type_getattro
-                || !_PyType_Lookup(meta, name).is_null()
+                || !type_lookup(meta, name).is_null()
             {
                 return false;
             }
-            let declared = _PyType_Lookup(class, name);
+            let declared = type_lookup(class, name);
             if declared.is_null() || ob_type(declared) != t_dict() {
                 return false;
             }
@@ -6063,7 +6059,9 @@ fn text_of<'a>(obj: &'a B<'_>) -> Option<&'a [u8]> {
 struct Exec<'a, 'py> {
     py: Python<'py>,
     prog: &'a Program,
-    untagged: bool,
+    /// Whether the input holds no tag, or ``None`` before the tag scan: an
+    /// ``object`` container is then neither the input itself nor a copy.
+    untagged: Option<bool>,
     stack: Vec<usize>,
 }
 
@@ -6139,8 +6137,10 @@ impl<'py> Exec<'_, 'py> {
         if kind != t_list() && kind != t_dict() {
             return Err(Stop::Abort);
         }
-        if self.untagged {
-            return Ok(raw.clone());
+        match self.untagged {
+            Some(true) => return Ok(raw.clone()),
+            Some(false) => {}
+            None => return Err(Stop::Abort),
         }
         if kind == t_dict()
             && let Some(special) = special_float(raw)
@@ -6449,7 +6449,14 @@ struct Compiling {
 
 impl<'py> Decoder<'py, '_> {
     /// The value the compiled program reads, or ``None`` for the frames.
-    fn run_program(&mut self, data: &B<'py>, target: &B<'py>, plan: &Rc<Plan>) -> Option<B<'py>> {
+    /// ``untagged`` is the tag scan's answer, ``None`` before it has run.
+    fn run_program(
+        &mut self,
+        data: &B<'py>,
+        target: &B<'py>,
+        plan: &Rc<Plan>,
+        untagged: Option<bool>,
+    ) -> Option<B<'py>> {
         if !plan.persistent
             || !matches!(self.allow_imports, Flag::Known(_))
             || !matches!(self.strict, Flag::Known(_))
@@ -6466,7 +6473,7 @@ impl<'py> Decoder<'py, '_> {
         let mut exec = Exec {
             py: self.py,
             prog: &program,
-            untagged: self.untagged,
+            untagged,
             stack: Vec::new(),
         };
         match exec.read(data, &program.root) {
@@ -6721,13 +6728,16 @@ impl<'py> Decoder<'py, '_> {
                 .get_item(PyString::intern(py, name))?
                 .is_some_and(|found| found.is(original.bind(py))))
         };
+        // ``field_slots`` is set only while ``fields`` is ``dataclasses.fields``.
         let [field_types, plain_hints, slot_names] = &g.field_types_own;
-        if !own("_field_types", field_types)?
-            || !own("_plain_hints", plain_hints)?
-            || !own("slot_names", slot_names)?
-        {
+        let (true, Some(field_slots)) = (
+            own("_field_types", field_types)?
+                && own("_plain_hints", plain_hints)?
+                && own("slot_names", slot_names)?,
+            g.field_slots.as_ref(),
+        ) else {
             return Ok(None);
-        }
+        };
         let cache = g.field_types_cache.bind(py);
         let [union_type, alias_type, module_type, weak_dict, modules] = &g.native_types;
         if !cache.get_type().is(weak_dict.bind(py)) {
@@ -6771,10 +6781,6 @@ impl<'py> Decoder<'py, '_> {
         }
         // Fields, in ``fields`` order, then slots: for a slotted dataclass
         // the slots are exactly its fields, so the names are the fields.
-        // ``field_slots`` is set only while ``fields`` is ``dataclasses.fields``.
-        let Some(field_slots) = g.field_slots.as_ref() else {
-            return Ok(None);
-        };
         let field_kind = field_slots.marker(py);
         let mut names: Vec<B<'py>> = Vec::with_capacity(declared.len());
         for (name, field) in dict_entries(&declared) {
