@@ -12,82 +12,13 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyString;
 
+use crate::class::{member_of, type_lookup, version_tag};
 use crate::py::*;
 
 /// ``PyMemberDef.flags`` bit that makes a read raise an audit event.
 const PY_AUDIT_READ: c_int = 2;
 /// ``PyMemberDef.flags`` bit for an offset not yet made absolute.
 const PY_RELATIVE_OFFSET: c_int = 8;
-
-/// The class's version tag, assigned if it has none; 0 when out of tags.
-#[inline]
-pub fn version_tag(kind: *mut ffi::PyTypeObject) -> u32 {
-    unsafe {
-        if (*kind).tp_version_tag == 0 {
-            PyUnstable_Type_AssignVersionTag(kind);
-        }
-        (*kind).tp_version_tag
-    }
-}
-
-unsafe extern "C" {
-    fn PyUnstable_Type_AssignVersionTag(kind: *mut ffi::PyTypeObject) -> c_int;
-}
-
-/// ``_PyType_Lookup``: the first entry for ``name`` in ``kind``'s MRO, borrowed,
-/// or null if none has it; ``None`` if the MRO cannot be read. ``name`` must be
-/// an exact ``str``, so no lookup runs Python code.
-pub unsafe fn type_lookup(
-    kind: *mut ffi::PyTypeObject,
-    name: *mut ffi::PyObject,
-) -> Option<*mut ffi::PyObject> {
-    unsafe {
-        let mro = (*kind).tp_mro;
-        if mro.is_null() || ffi::PyTuple_Check(mro) == 0 {
-            return None;
-        }
-        for index in 0..ffi::PyTuple_GET_SIZE(mro) {
-            let base = ffi::PyTuple_GET_ITEM(mro, index);
-            if ffi::PyType_Check(base) == 0 {
-                return None;
-            }
-            let dict = ffi::PyType_GetDict(base.cast());
-            if dict.is_null() {
-                ffi::PyErr_Clear();
-                return None;
-            }
-            // The class keeps its dict, and the dict the entry, alive.
-            let found = ffi::PyDict_GetItemWithError(dict, name);
-            ffi::Py_DECREF(dict);
-            if !found.is_null() {
-                return Some(found);
-            }
-            if !ffi::PyErr_Occurred().is_null() {
-                ffi::PyErr_Clear();
-                return None;
-            }
-        }
-        Some(std::ptr::null_mut())
-    }
-}
-
-/// The slot ``found`` describes for instances of ``kind``, if it is a member
-/// descriptor that applies to them.
-pub unsafe fn member_of(
-    kind: *mut ffi::PyTypeObject,
-    found: *mut ffi::PyObject,
-) -> *mut ffi::PyMemberDef {
-    unsafe {
-        if found.is_null() || ffi::Py_TYPE(found) != &raw mut ffi::PyMemberDescr_Type {
-            return std::ptr::null_mut();
-        }
-        let descr = found.cast::<ffi::PyMemberDescrObject>();
-        if ffi::PyType_IsSubtype(kind, (*descr).d_common.d_type) == 0 {
-            return std::ptr::null_mut();
-        }
-        (*descr).d_member.cast::<ffi::PyMemberDef>()
-    }
-}
 
 // Perf: exp000 from_plain, paired: SetTable, HasTable, FieldSlots and HintGuard together
 // 1.18-1.21x.
@@ -166,10 +97,7 @@ impl SetTable {
         if let Some(member) = find_name(&self.names, name, guess) {
             return *member;
         }
-        let found = unsafe { type_lookup(kind, name.as_ptr()) };
-        let member = found.map_or(std::ptr::null_mut(), |found| unsafe {
-            member_of(kind, found)
-        });
+        let member = unsafe { member_of(kind, type_lookup(kind, name.as_ptr())) };
         if self.names.len() < NAMES_LIMIT {
             self.names.push((name.clone().unbind(), member));
         }
@@ -264,11 +192,9 @@ impl HasTable {
             if (*kind).tp_getattro.map(|f| f as usize) != generic_getattr_slot() {
                 return Has::Ask;
             }
-            let Some(found) = type_lookup(kind, name) else {
-                return Has::Ask;
-            };
+            let found = type_lookup(kind, name);
             // A ``__getattr__`` turns a failed or raising lookup into anything.
-            let fallback = type_lookup(kind, getattr).is_some_and(|found| !found.is_null());
+            let fallback = !type_lookup(kind, getattr).is_null();
             let has_dict = (*kind).tp_dictoffset != 0
                 || ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_MANAGED_DICT) != 0;
             if found.is_null() {
@@ -360,21 +286,14 @@ pub fn new_callable_stable(
         let getattr = pyo3::intern!(py, "__getattribute__").as_ptr();
         // A metaclass ``__getattribute__`` other than ``type``'s, or a data
         // descriptor ``__new__`` on the metaclass, answers for itself.
-        let std_getattribute = type_lookup(&raw mut ffi::PyType_Type, getattr);
-        match type_lookup(meta, getattr) {
-            Some(found) if Some(found) != std_getattribute => return false,
-            None => return false,
-            _ => {}
-        }
-        if let Some(found) = type_lookup(meta, new)
-            && !found.is_null()
-            && (*ffi::Py_TYPE(found)).tp_descr_set.is_some()
-        {
+        if type_lookup(meta, getattr) != type_lookup(&raw mut ffi::PyType_Type, getattr) {
             return false;
         }
-        let Some(found) = type_lookup(kind, new) else {
+        let found = type_lookup(meta, new);
+        if !found.is_null() && (*ffi::Py_TYPE(found)).tp_descr_set.is_some() {
             return false;
-        };
+        }
+        let found = type_lookup(kind, new);
         if found.is_null() {
             return false;
         }
@@ -420,8 +339,7 @@ impl FieldSlots {
         let tag = version_tag(kind);
         let offset = |name: &str| -> Option<ffi::Py_ssize_t> {
             let name = PyString::new(py, name);
-            let found = unsafe { type_lookup(kind, name.as_ptr()) }?;
-            let member = unsafe { member_of(kind, found) };
+            let member = unsafe { member_of(kind, type_lookup(kind, name.as_ptr())) };
             (!member.is_null() && unsafe { (*member).type_code } == ffi::Py_T_OBJECT_EX)
                 .then(|| unsafe { (*member).offset })
         };

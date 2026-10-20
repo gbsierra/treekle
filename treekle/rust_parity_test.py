@@ -2471,7 +2471,9 @@ class _GcProbe:
 
 # A hook may read or switch the cyclic collector; the walk leaves it alone.
 @pytest.mark.parametrize(
-    "enabled", [True, False], ids=["collector on", "collector off"]
+    "enabled",
+    [True, False],
+    ids=["collector on", "collector off"],
 )
 def test_a_hook_sees_and_keeps_the_collector_state_as_python_does(
     enabled: bool,
@@ -2711,7 +2713,7 @@ class _FrozenRow:
 
 
 @dataclass(
-    kw_only=True
+    kw_only=True,
 )  # house-ignore[dataclass] -- The dict-backed row: its fields live in __dict__.
 class _DictRow:
     id: int
@@ -2866,14 +2868,19 @@ def test_typed_json_loads_reads_as_from_plain_of_json_loads(
     def python() -> object:
         tree = cast("PlainTree", json.loads(text))
         return deserialize._python_from_plain(
-            tree, target, strict=strict, allow_imports=True
+            tree,
+            target,
+            strict=strict,
+            allow_imports=True,
         )
 
     expected = _read_outcome(python)
     for _ in range(_TIMES):
         assert (
             _read_outcome(
-                lambda: wire.json_loads(text, target, strict=strict, allow_imports=True)
+                lambda: wire.json_loads(
+                    text, target, strict=strict, allow_imports=True
+                ),
             )
             == expected
         )
@@ -2909,7 +2916,10 @@ def _dumps_outcomes(
 
     def python() -> str:
         tree = serialize._python_to_plain(
-            value, dialect=style, hooks=hooks or {}, sort=layout.sort
+            value,
+            dialect=style,
+            hooks=hooks or {},
+            sort=layout.sort,
         )
         return json.dumps(
             tree,
@@ -2947,7 +2957,10 @@ def test_json_dumps_writes_json_dumps_of_to_plain(
     layout: str,
 ) -> None:
     written, expected = _dumps_outcomes(
-        value, dialect=dialect, hooks=hooks, layout=_LAYOUTS[layout]
+        value,
+        dialect=dialect,
+        hooks=hooks,
+        layout=_LAYOUTS[layout],
     )
     assert written == expected
 
@@ -2969,7 +2982,10 @@ def test_json_loads_reads_back_what_json_dumps_wrote(
     def python() -> object:
         tree = cast("PlainTree", json.loads(text))
         return deserialize._python_from_plain(
-            tree, object, hooks=hooks or {}, allow_imports=True
+            tree,
+            object,
+            hooks=hooks or {},
+            allow_imports=True,
         )
 
     assert _read_outcome(
@@ -3007,7 +3023,10 @@ def test_json_dumps_takes_odd_options_as_json_dumps_does(
     )
     value = [_tree(), {"\u00e9": [1.5, None], "b": (1, 2)}]
     written, expected = _dumps_outcomes(
-        value, dialect="json", hooks=None, layout=layout
+        value,
+        dialect="json",
+        hooks=None,
+        layout=layout,
     )
     assert written == expected
 
@@ -3290,7 +3309,9 @@ def _assert_dumps_with_hooks_alike(
 ) -> None:
     written, python = _hole_writers(layout)
     assert _counted_dumps(make, written, payload) == _counted_dumps(
-        make, python, payload
+        make,
+        python,
+        payload,
     )
 
 
@@ -3317,7 +3338,7 @@ def test_json_dumps_gives_up_where_json_does_on_a_deep_tree() -> None:
         return cast("tuple[object, ...]", outcome)[:2], calls
 
     assert kind(lambda tree, hooks: wire.json_dumps(tree, hooks=hooks)) == kind(
-        lambda tree, hooks: json.dumps(serialize._python_to_plain(tree, hooks=hooks))
+        lambda tree, hooks: json.dumps(serialize._python_to_plain(tree, hooks=hooks)),
     )
 
 
@@ -3486,13 +3507,19 @@ def _flag_cases() -> dict[str, _FlagCase]:
         "sort_keys": _FlagCase([{"b": 1, "a": 2}], sorts=True),
         "ensure_ascii that grows the value": _FlagCase([1], grows=True),
         "sort_keys that grows the value": _FlagCase(
-            [1], truth=False, sorts=True, grows=True
+            [1],
+            truth=False,
+            sorts=True,
+            grows=True,
         ),
         "ensure_ascii that grows an indented value": _FlagCase(
-            [1], grows=True, indent=1
+            [1],
+            grows=True,
+            indent=1,
         ),
         "raising, with a value that cannot be encoded": _FlagCase(
-            [_Unreducible()], raises=True
+            [_Unreducible()],
+            raises=True,
         ),
         "raising, with a value that can": _FlagCase([1], raises=True),
     }
@@ -3513,7 +3540,7 @@ def test_json_dumps_asks_a_flags_truth_when_json_dumps_does(case: str) -> None:
         )
         flag = _Flag(truth, action)
         outcome = _text_outcome(
-            lambda: write(value, True, flag) if sorts else write(value, flag, False)
+            lambda: write(value, True, flag) if sorts else write(value, flag, False),
         )
         return outcome, flag.asked
 
@@ -3556,13 +3583,15 @@ def test_json_dumps_reads_separators_after_hooks_run(kind: type) -> None:
 
     assert run(
         lambda value, hooks, separators: wire.json_dumps(
-            value, hooks=hooks, separators=cast("tuple[str, str]", separators)
-        )
+            value,
+            hooks=hooks,
+            separators=cast("tuple[str, str]", separators),
+        ),
     ) == run(
         lambda value, hooks, separators: json.dumps(
             serialize._python_to_plain(value, hooks=hooks),
             separators=cast("tuple[str, str]", separators),
-        )
+        ),
     )
 
 
@@ -3621,7 +3650,7 @@ def test_floats_parse_and_write_as_json_does() -> None:
     samples = _float_samples()
     text = "[" + ", ".join(_float_texts(samples)) + "]"
     assert _text_outcome(lambda: wire.json_loads(text)) == _text_outcome(
-        lambda: cast("object", json.loads(text))
+        lambda: cast("object", json.loads(text)),
     )
 
     def python() -> object:
@@ -3629,7 +3658,7 @@ def test_floats_parse_and_write_as_json_does() -> None:
         return deserialize._python_from_plain(tree, list[float])
 
     assert _read_outcome(lambda: wire.json_loads(text, list[float])) == _read_outcome(
-        python
+        python,
     )
     rows = (
         "[" + ", ".join(f'{{"id": 0, "score": {value!r}}}' for value in samples) + "]"
@@ -3640,7 +3669,7 @@ def test_floats_parse_and_write_as_json_does() -> None:
         return deserialize._python_from_plain(tree, list[_FrozenRow])
 
     assert _read_outcome(
-        lambda: wire.json_loads(rows, list[_FrozenRow])
+        lambda: wire.json_loads(rows, list[_FrozenRow]),
     ) == _read_outcome(python_rows)
     assert wire.json_dumps(samples) == json.dumps(serialize._python_to_plain(samples))
 
@@ -3690,7 +3719,8 @@ def _string_samples() -> list[str]:
 def test_strings_parse_and_write_as_json_does(ensure_ascii: bool) -> None:
     samples = _string_samples()
     expected = json.dumps(
-        serialize._python_to_plain(samples), ensure_ascii=ensure_ascii
+        serialize._python_to_plain(samples),
+        ensure_ascii=ensure_ascii,
     )
     assert wire.json_dumps(samples, ensure_ascii=ensure_ascii) == expected
     keyed = {text: index for index, text in enumerate(samples)}
@@ -3705,7 +3735,7 @@ def test_strings_parse_and_write_as_json_does(ensure_ascii: bool) -> None:
         return deserialize._python_from_plain(tree, list[str])
 
     assert _read_outcome(lambda: wire.json_loads(expected, list[str])) == _read_outcome(
-        python
+        python,
     )
 
 

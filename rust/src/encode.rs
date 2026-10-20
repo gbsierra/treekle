@@ -22,7 +22,7 @@
 //! not move that generation on: every fact kept for another key is still
 //! true, and the new key's own fact is read from the dict when first needed.
 
-use std::ffi::{CString, c_void};
+use std::ffi::c_void;
 use std::rc::Rc;
 
 use hashbrown::HashMap;
@@ -778,7 +778,7 @@ unsafe fn plain_key_raw(key: *mut ffi::PyObject) -> bool {
         let text = if compact_ascii_str(key) {
             ascii_bytes(key)
         } else {
-            match utf8_raw(key) {
+            match utf8_ptr(key) {
                 Some(text) => text,
                 None => return false,
             }
@@ -805,6 +805,14 @@ const IN_PLACE_DEPTH: usize = 48;
 
 /// The frame an escaped key's own parts hang from, Python's ``_IN_KEY``.
 const IN_KEY: u32 = 1;
+
+/// What ``_encode_reduce`` writes for a value: its protocols, a ``py/type``
+/// import path, or a ``py/reduce`` of these parts.
+enum Recipe<'py> {
+    Unreduced,
+    Path(B<'py>),
+    Parts(Vec<B<'py>>),
+}
 
 /// Where in its node a part is written.
 #[derive(Clone)]
@@ -848,54 +856,13 @@ fn write<'py>(node: &B<'py>, slot: &Slot<'py>, done: B<'py>) -> PyResult<()> {
     }
 }
 
-unsafe extern "C" {
-    #[cfg(Py_3_13)]
-    fn PyDict_GetItemStringRef(
-        dp: *mut ffi::PyObject,
-        key: *const std::ffi::c_char,
-        result: *mut *mut ffi::PyObject,
-    ) -> std::ffi::c_int;
-}
-
-/// ``PyDict_GetItemString`` with a strong reference out, 1/0/-1 as found.
-#[cfg(Py_3_13)]
-unsafe fn string_item(
-    dict: *mut ffi::PyObject,
-    key: *const std::ffi::c_char,
-    out: &mut *mut ffi::PyObject,
-) -> std::ffi::c_int {
-    unsafe { PyDict_GetItemStringRef(dict, key, out) }
-}
-
-/// ``PyDict_GetItemString`` with a strong reference out, 1/0/-1 as found.
-#[cfg(not(Py_3_13))]
-unsafe fn string_item(
-    dict: *mut ffi::PyObject,
-    key: *const std::ffi::c_char,
-    out: &mut *mut ffi::PyObject,
-) -> std::ffi::c_int {
-    unsafe {
-        let found = ffi::PyDict_GetItemString(dict, key);
-        if found.is_null() {
-            return if ffi::PyErr_Occurred().is_null() {
-                0
-            } else {
-                -1
-            };
-        }
-        ffi::Py_INCREF(found);
-        *out = found;
-        1
-    }
-}
-
 /// Whether ``value`` is an exact list or tuple of ``is_leaf_value`` items.
 #[inline]
 fn all_leaf_items(value: &B<'_>) -> bool {
     let op = value.as_ptr();
     let kind = tp(value);
     let leaf = |item: *mut ffi::PyObject| {
-        let kind = tp_ptr(item);
+        let kind = ob_type(item);
         kind == t_str()
             || kind == t_int()
             || kind == t_bool()
@@ -1513,7 +1480,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 layouts: [None, None],
                 enum_member: None,
                 own_reduce: None,
-                dict_order: None,
             };
             let stale = self.classes.insert(key, info);
             drop(stale);
@@ -1597,20 +1563,40 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let Some((path, layout)) = planned else {
             return Ok(None);
         };
+        self.object_fast(value, kind, path, &layout, sort, frame, true)
+    }
+
+    /// ``encode_object`` read from ``layout``: a ``direct`` class's slots, or
+    /// a ``dict_plain`` instance's dict by ``dict_read``. ``None``, with nothing
+    /// registered, where neither applies. ``register`` registers ``value``
+    /// once the read is certain, for a caller that has not.
+    #[allow(clippy::too_many_arguments)]
+    fn object_fast(
+        &mut self,
+        value: &B<'py>,
+        kind: &B<'py>,
+        path: B<'py>,
+        layout: &Layout,
+        sort: bool,
+        frame: u32,
+        register: bool,
+    ) -> PyResult<Option<B<'py>>> {
         if layout.direct {
-            self.register(value, frame);
-            return self.direct_object(value, path, &layout, frame).map(Some);
+            if register {
+                self.register(value, frame);
+            }
+            return self.direct_object(value, path, layout, frame).map(Some);
         }
-        if !layout.stamp.holds(kind) {
+        if !(layout.dict_plain && layout.stamp.holds(kind)) {
             return Ok(None);
         }
-        // Registered only once the read is certain, so a decline leaves the
-        // value to ``encode_object`` untouched.
         let mut found = [std::ptr::null_mut(); DICT_LIMIT];
-        let Some((_dict, order)) = self.dict_read(value, kind, &layout, sort, &mut found)? else {
+        let Some((_dict, order)) = self.dict_read(value, kind, layout, sort, &mut found)? else {
             return Ok(None);
         };
-        self.register(value, frame);
+        if register {
+            self.register(value, frame);
+        }
         self.dict_object(path, &order, &found, frame).map(Some)
     }
 
@@ -1707,7 +1693,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
                 layouts,
                 enum_member: None,
                 own_reduce: None,
-                dict_order: None,
             };
             let stale = self.classes.insert(key, info);
             drop(stale);
@@ -2477,18 +2462,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
             let sort = self.sort.get()?;
             if let Some(layout) = self.layout(kind, sort)?
                 && layout.stamp.holds(kind)
+                && let Some(done) =
+                    self.object_fast(value, kind, path.clone(), &layout, sort, frame, false)?
             {
-                if layout.direct {
-                    return self.direct_object(value, path, &layout, frame);
-                }
-                if layout.dict_plain {
-                    let mut found = [std::ptr::null_mut(); DICT_LIMIT];
-                    if let Some((_dict, order)) =
-                        self.dict_read(value, kind, &layout, sort, &mut found)?
-                    {
-                        return self.dict_object(path, &order, &found, frame);
-                    }
-                }
+                return Ok(done);
             }
         }
         let members = self.object_members(value, kind)?;
@@ -2735,11 +2712,22 @@ impl<'py, 'g> Encoder<'py, 'g> {
         } else {
             optional_attr(value, intern!(py, "__dict__").as_any())?
         };
-        if layout.len() == 0
-            && let Some(state) = &state
-            && let Some(members) = self.dict_members(value, kind, state, sort)?
-        {
-            return Ok(members);
+        if layout.dict_plain && layout.stamp.holds(kind) {
+            let mut found = [std::ptr::null_mut(); DICT_LIMIT];
+            if let Some((_dict, order)) = self.dict_read(value, kind, &layout, sort, &mut found)? {
+                let pending = self.g.pending.as_ptr();
+                return Ok(order
+                    .order
+                    .iter()
+                    .filter(|&&index| found[index as usize] != pending)
+                    .map(|&index| unsafe {
+                        (
+                            order.keys[index as usize].bind(py).clone(),
+                            B::from_borrowed_ptr(py, found[index as usize]),
+                        )
+                    })
+                    .collect());
+            }
         }
         if let Some(state) = state
             && state.is_truthy()?
@@ -2789,111 +2777,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
         Ok(members)
     }
 
-    /// The members of a slotless object read straight from its ``__dict__``,
-    /// or ``None`` where ``getattr`` might answer otherwise.
-    ///
-    /// ``getattr`` returns the instance dict's entry unless the class has a
-    /// data descriptor of that name, or its lookup is not ``object``'s; and
-    /// only when ``__dict__`` is the dict that lookup reads. With exact str
-    /// keys no Python code runs, so the dict cannot change while it is read.
-    fn dict_members(
-        &mut self,
-        value: &B<'py>,
-        kind: &B<'py>,
-        state: &B<'py>,
-        sort: bool,
-    ) -> PyResult<Option<Vec<(B<'py>, B<'py>)>>> {
-        let py = self.py;
-        let class = kind.as_ptr().cast::<ffi::PyTypeObject>();
-        if tp(state) != t_dict() || !generic_getattr(class) {
-            return Ok(None);
-        }
-        let generic = unsafe {
-            Bound::from_owned_ptr_or_opt(
-                py,
-                PyObject_GenericGetDict(value.as_ptr(), std::ptr::null_mut()),
-            )
-        };
-        match generic {
-            Some(generic) if generic.is(state) => {}
-            Some(_) => return Ok(None),
-            None => {
-                unsafe { ffi::PyErr_Clear() };
-                return Ok(None);
-            }
-        }
-        let entries = dict_entries(unsafe { state.cast_unchecked::<PyDict>() });
-        // The order and the descriptor check are kept per class only while the
-        // class is unchanged, so its keys need no fresh lookup.
-        let now = self.current()?;
-        let known = self
-            .known(kind, now)
-            .and_then(|info| info.dict_order.as_ref());
-        if let Some(order) = known
-            && order.keys.len() == entries.len()
-            && order
-                .keys
-                .iter()
-                .zip(&entries)
-                .all(|(key, (each, _))| key.as_ptr() == each.as_ptr())
-        {
-            let pending = self.b(&self.g.pending);
-            let mut members = Vec::with_capacity(entries.len());
-            let pick = |index: usize| entries[index].clone();
-            if sort {
-                for &index in &order.sorted {
-                    let (key, member) = pick(index);
-                    if !member.is(pending) {
-                        members.push((key, member));
-                    }
-                }
-            } else {
-                for index in 0..entries.len() {
-                    let (key, member) = pick(index);
-                    if !member.is(pending) {
-                        members.push((key, member));
-                    }
-                }
-            }
-            return Ok(Some(members));
-        }
-        let before = Stamp::always(kind);
-        let mut keyed = Vec::with_capacity(entries.len());
-        for (index, (key, _)) in entries.iter().enumerate() {
-            if tp(key) != t_str() {
-                return Ok(None);
-            }
-            let found = unsafe { _PyType_Lookup(class, key.as_ptr()) };
-            if !found.is_null() && unsafe { (*ob_type(found)).tp_descr_set.is_some() } {
-                return Ok(None);
-            }
-            keyed.push(([key.clone()], index));
-        }
-        let sorted = sorted_by_keys(py, keyed)?;
-        let order = DictOrder {
-            keys: entries
-                .iter()
-                .map(|(key, _)| key.clone().unbind())
-                .collect(),
-            sorted: sorted.clone(),
-        };
-        let pending = self.b(&self.g.pending).clone();
-        let indices: Vec<usize> = if sort {
-            sorted
-        } else {
-            (0..entries.len()).collect()
-        };
-        let members = indices
-            .into_iter()
-            .map(|index| entries[index].clone())
-            .filter(|(_, member)| !member.is(&pending))
-            .collect();
-        if let Some(info) = self.keep(kind, now, &before) {
-            info.dict_order = Some(order);
-        }
-        Ok(Some(members))
-    }
-
     /// ``getattr(value, name, PENDING)`` unless that is ``PENDING``, read
     /// from the slot's offset while the class is as the layout found it.
     fn member(
@@ -2939,43 +2822,10 @@ impl<'py, 'g> Encoder<'py, 'g> {
         slot: &Slot<'py>,
     ) -> PyResult<B<'py>> {
         let py = self.py;
-        let recipe = if self.enum_member(kind)? {
-            self.enum_recipe(value, kind)?
-        } else {
-            None
-        };
-        let native = match recipe {
-            Some(parts) => Some(parts),
-            None if let Some(recipe) = self.own_recipe(value, kind)? => match recipe {
-                None => Some(Vec::new()),
-                Some(recipe) if is_str(&recipe) => None,
-                Some(recipe) => Some(recipe.try_iter()?.collect::<PyResult<Vec<_>>>()?),
-            },
-            None if self.env.reduce_own => self.native_reduce(value)?,
-            None => None,
-        };
-        let mut parts = match native {
-            Some(parts) if parts.is_empty() => return self.encode_unreduced(value, frame),
-            // A bare-name reduce, its path verified natively.
-            Some(mut parts) if parts.len() == 1 => {
-                return self.tagged(intern!(py, "py/type"), parts.remove(0));
-            }
-            Some(parts) => parts,
-            None => {
-                let recipe = self.env.canonical_reduce.bind(py).call1((value,))?;
-                if recipe.is_none() {
-                    return self.encode_unreduced(value, frame);
-                }
-                // A bare-name reduce names a module global, written as an
-                // import path.
-                if is_str(&recipe) {
-                    let module = kind.getattr(intern!(py, "__module__"))?;
-                    let path = format!("{}.{}", module.str()?.to_cow()?, recipe.str()?.to_cow()?);
-                    let path = self.env.verified_path.bind(py).call1((path, value))?;
-                    return self.tagged(intern!(py, "py/type"), path);
-                }
-                recipe.try_iter()?.collect::<PyResult<Vec<_>>>()?
-            }
+        let mut parts = match self.recipe(value, kind)? {
+            Recipe::Unreduced => return self.encode_unreduced(value, frame),
+            Recipe::Path(path) => return self.tagged(intern!(py, "py/type"), path),
+            Recipe::Parts(parts) => parts,
         };
         let mark = self.alive.len();
         // A hashable value with no state beyond its arguments (an enum
@@ -2997,63 +2847,6 @@ impl<'py, 'g> Encoder<'py, 'g> {
         let parts = PyList::new(py, parts)?;
         self.push_items(&parts, frame)?;
         self.tagged(intern!(py, "py/reduce"), parts.into_any())
-    }
-
-    /// ``_canonical_reduce(value)``, read natively: ``Some(empty)`` where it
-    /// gives ``None``, ``None`` where Python must answer (a str recipe, a
-    /// ``PurePath`` or ``partial``, which it rewrites).
-    fn native_reduce(&self, value: &B<'py>) -> PyResult<Option<Vec<B<'py>>>> {
-        let py = self.py;
-        let class = tp(value);
-        let subtype = |base: &Py<PyAny>| unsafe {
-            ffi::PyType_IsSubtype(class, base.as_ptr().cast::<ffi::PyTypeObject>()) != 0
-        };
-        if subtype(&self.g.pure_path) || subtype(&self.g.partial) {
-            return Ok(None);
-        }
-        let reduced = match value.call_method1(intern!(py, "__reduce_ex__"), (2,)) {
-            Ok(reduced) => reduced,
-            Err(error)
-                if error.is_instance_of::<PyAttributeError>(py)
-                    || error.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py)
-                    || error.is_instance_of::<PyTypeError>(py)
-                    || error.is_instance_of::<PyValueError>(py) =>
-            {
-                return Ok(Some(Vec::new()));
-            }
-            Err(error) => return Err(error),
-        };
-        if is_str(&reduced) {
-            return Ok(self.global_path(value, &reduced)?.map(|path| vec![path]));
-        }
-        if !is_tuple(&reduced) {
-            return Ok(Some(Vec::new()));
-        }
-        let reduced = unsafe { reduced.cast_unchecked::<PyTuple>() };
-        let size = reduced.len();
-        if !(2..=5).contains(&size) {
-            return Ok(Some(Vec::new()));
-        }
-        let func = reduced.get_item(0)?;
-        let args = reduced.get_item(1)?;
-        if !is_callable(&func) || !is_tuple(&args) {
-            return Ok(Some(Vec::new()));
-        }
-        let mut parts = Vec::with_capacity(size);
-        parts.push(func);
-        parts.push(args);
-        for index in 2..size {
-            let part = reduced.get_item(index)?;
-            // ``list(part)`` for the list and dict item iterators.
-            let part = if (index == 3 || index == 4) && !part.is_none() {
-                let listed = unsafe { ffi::PySequence_List(part.as_ptr()) };
-                unsafe { Bound::from_owned_ptr_or_err(py, listed)? }
-            } else {
-                part
-            };
-            parts.push(part);
-        }
-        Ok(Some(parts))
     }
 
     /// Whether ``kind``'s ``__reduce_ex__(2)`` is ``object``'s own calling a
@@ -3192,111 +2985,55 @@ impl<'py, 'g> Encoder<'py, 'g> {
         Ok(self.ordered(members, frame)?.iter().collect())
     }
 
-    /// ``_canonical_reduce(value)``: natively where the class's own
-    /// ``__reduce__`` or ``__reduce_ex__(2)`` is all it calls, else by
-    /// Python's function. ``None`` where it gives ``None``.
-    fn reduced(&mut self, value: &B<'py>, kind: &B<'py>) -> PyResult<Option<B<'py>>> {
-        if let Some(recipe) = self.own_recipe(value, kind)? {
-            return Ok(recipe);
-        }
-        if self.env.reduce_own {
-            let py = self.py;
-            let reduced = match value.call_method1(intern!(py, "__reduce_ex__"), (2,)) {
-                Ok(reduced) => reduced,
-                Err(error)
-                    if error.is_instance_of::<PyAttributeError>(py)
-                        || error.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py)
-                        || error.is_instance_of::<PyTypeError>(py)
-                        || error.is_instance_of::<PyValueError>(py) =>
-                {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
-            return self.canonical_recipe(value, &reduced);
-        }
-        let recipe = self.env.canonical_reduce.bind(self.py).call1((value,))?;
-        Ok((!recipe.is_none()).then_some(recipe))
-    }
-    /// ``_verified_path(path, value)`` proven without a Python call: the
-    /// longest prefix of ``path`` loaded in ``sys.modules`` walks to
-    /// ``value`` itself through plain module attributes. Only success
-    /// answers here; anything else needs Python's own check, errors included.
-    fn verified_fast(&self, path: &str, value: &B<'py>) -> bool {
+    /// ``_encode_reduce``'s recipe for ``value``: an enum member's from its
+    /// own attributes, a custom ``__reduce__``'s or ``__reduce_ex__(2)``'s read
+    /// natively while ``_canonical_reduce`` is the module's own, else
+    /// ``_canonical_reduce``'s. A bare name is a module global, written as its
+    /// verified import path.
+    fn recipe(&mut self, value: &B<'py>, kind: &B<'py>) -> PyResult<Recipe<'py>> {
         let py = self.py;
-        if path.bytes().any(|byte| byte == 0) {
-            return false;
+        if self.enum_member(kind)?
+            && let Some(parts) = self.enum_recipe(value, kind)?
+        {
+            return Ok(Recipe::Parts(parts));
         }
-        // ``sys.modules`` as ``resolve_import`` reads it: the attribute of
-        // the ``sys`` module, only while it is the interpreter's own dict.
-        let modules = unsafe {
-            let sys = ffi::PyImport_AddModule(c"sys".as_ptr());
-            if sys.is_null() {
-                ffi::PyErr_Clear();
-                return false;
-            }
-            let mut attr = std::ptr::null_mut();
-            match string_item(ffi::PyModule_GetDict(sys), c"modules".as_ptr(), &mut attr) {
-                1 => {}
-                0 => return false,
-                _ => {
-                    ffi::PyErr_Clear();
-                    return false;
-                }
-            }
-            let current = attr == ffi::PyImport_GetModuleDict() && tp_ptr(attr) == t_dict();
-            ffi::Py_DECREF(attr);
-            if !current {
-                return false;
-            }
-            ffi::PyImport_GetModuleDict()
-        };
-        let parts: Vec<&str> = path.split('.').collect();
-        for split in (1..parts.len()).rev() {
-            let Ok(prefix) = CString::new(parts[..split].join(".")) else {
-                return false;
-            };
-            let mut module = std::ptr::null_mut();
-            match unsafe { string_item(modules, prefix.as_ptr(), &mut module) } {
-                1 => {}
-                0 => continue,
-                _ => {
-                    unsafe { ffi::PyErr_Clear() };
-                    return false;
-                }
-            }
-            // The loaded prefix; ``_walk`` reads plain module attributes,
-            // and a miss sends Python to its import phase.
-            let mut here = unsafe { B::from_owned_ptr(py, module) };
-            let mut walked = true;
-            for part in &parts[split..] {
-                if tp(&here) != self.g.paths.module_type.as_ptr().cast() {
-                    walked = false;
-                    break;
-                }
-                let Ok(name) = CString::new(*part) else {
-                    return false;
-                };
-                let mut next = std::ptr::null_mut();
-                let found = unsafe {
-                    string_item(
-                        ffi::PyModule_GetDict(here.as_ptr()),
-                        name.as_ptr(),
-                        &mut next,
-                    )
-                };
-                if found <= 0 {
-                    if found < 0 {
-                        unsafe { ffi::PyErr_Clear() };
+        let recipe = match self.own_recipe(value, kind)? {
+            Some(recipe) => recipe,
+            None if self.env.reduce_own => {
+                match value.call_method1(intern!(py, "__reduce_ex__"), (2,)) {
+                    Ok(reduced) => self.canonical_recipe(value, &reduced)?,
+                    Err(error)
+                        if error.is_instance_of::<PyAttributeError>(py)
+                            || error
+                                .is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py)
+                            || error.is_instance_of::<PyTypeError>(py)
+                            || error.is_instance_of::<PyValueError>(py) =>
+                    {
+                        None
                     }
-                    walked = false;
-                    break;
+                    Err(error) => return Err(error),
                 }
-                here = unsafe { B::from_owned_ptr(py, next) };
             }
-            return walked && here.is(value);
+            None => {
+                let recipe = self.env.canonical_reduce.bind(py).call1((value,))?;
+                (!recipe.is_none()).then_some(recipe)
+            }
+        };
+        let Some(recipe) = recipe else {
+            return Ok(Recipe::Unreduced);
+        };
+        if is_str(&recipe) {
+            if let Some(path) = self.global_path(value, &recipe)? {
+                return Ok(Recipe::Path(path));
+            }
+            let module = kind.getattr(intern!(py, "__module__"))?;
+            let path = format!("{}.{}", module.str()?.to_cow()?, recipe.str()?.to_cow()?);
+            let path = self.env.verified_path.bind(py).call1((path, value))?;
+            return Ok(Recipe::Path(path));
         }
-        false
+        Ok(Recipe::Parts(
+            recipe.try_iter()?.collect::<PyResult<Vec<_>>>()?,
+        ))
     }
 
     /// ``_verified_path(f"{type(value).__module__}.{name}", value)`` where it
@@ -3565,8 +3302,6 @@ pub fn to_plain<'py>(
     let kind = tp(obj);
     let tree = if kind == t_str() || kind == t_int() || kind == t_bool() || kind == t_none() {
         obj.clone()
-    } else if let Some(tree) = quick_plain(py, g, obj, python_dialect, hooks.as_ref())? {
-        tree
     } else {
         let hooks = hooks.unwrap_or_else(|| g.default_hooks.bind(py).clone());
         let sort = Flag::new(sort, true);
@@ -3600,114 +3335,6 @@ pub fn to_plain<'py>(
         tree?
     };
     finish(py, g, tree, mutable.as_ref())
-}
-
-// Perf: tiny to_plain (small dict + list), paired min: with a kept env, 1,063 -> 431 ns (from
-// 78512ab).
-/// ``obj`` encoded without the walk when it is already plain: exact dicts and
-/// lists of plain leaves. The walk's answer for these is a copy with the same
-/// keys and items; its registrations only matter when a container repeats (a
-/// ``py/ref``, or a cycle, which cannot encode), so a repeated address here
-/// bails to the walk, as do hooks, a replaced ``dict`` or ``list`` encoder,
-/// and nesting deep enough to recurse unsafe.
-fn quick_plain<'py>(
-    py: Python<'py>,
-    g: &EncGlobals,
-    obj: &B<'py>,
-    python_dialect: bool,
-    hooks: Option<&B<'py>>,
-) -> PyResult<Option<B<'py>>> {
-    let kind = tp(obj);
-    if kind != t_dict() && kind != t_list() {
-        return Ok(None);
-    }
-    // A list of records, the common root that is not plain, fails on its
-    // first item; checking it first spares a doomed attempt.
-    if kind == t_list()
-        && let Some(&first) = unsafe { borrowed_items(obj) }.first()
-    {
-        let first = ob_type(first);
-        if !(first == t_str()
-            || first == t_int()
-            || first == t_bool()
-            || first == t_none()
-            || first == t_float()
-            || first == t_dict()
-            || first == t_list())
-        {
-            return Ok(None);
-        }
-    }
-    if let Some(hooks) = hooks
-        && !(hooks.is(g.default_hooks.bind(py)) && hooks.len()? == 0)
-    {
-        return Ok(None);
-    }
-    let env = Env::current(py, g, sync::ENCODE.rewrites())?;
-    if !env.native_encoders(g) {
-        return Ok(None);
-    }
-    let mut seen = hashbrown::HashSet::new();
-    quick_plain_node(py, obj, python_dialect, &mut seen, 0)
-}
-
-fn quick_plain_node<'py>(
-    py: Python<'py>,
-    obj: &B<'py>,
-    python_dialect: bool,
-    seen: &mut hashbrown::HashSet<usize>,
-    depth: u32,
-) -> PyResult<Option<B<'py>>> {
-    let kind = tp(obj);
-    if kind == t_str() || kind == t_int() || kind == t_bool() || kind == t_none() {
-        return Ok(Some(obj.clone()));
-    }
-    if kind == t_float() {
-        let finite = unsafe { ffi::PyFloat_AS_DOUBLE(obj.as_ptr()) }.is_finite();
-        return Ok((python_dialect || finite).then(|| obj.clone()));
-    }
-    if depth >= 100 || !seen.insert(obj.as_ptr() as usize) {
-        return Ok(None);
-    }
-    if kind == t_dict() {
-        // Read and checked before the copy is built, so no Python code runs
-        // while a dict is read.
-        let entries = dict_entries(unsafe { obj.cast_unchecked::<PyDict>() });
-        let mut done = Vec::with_capacity(entries.len());
-        for (key, item) in entries {
-            if !unsafe { plain_key_raw(key.as_ptr()) } {
-                return Ok(None);
-            }
-            let Some(item) = quick_plain_node(py, &item, python_dialect, seen, depth + 1)? else {
-                return Ok(None);
-            };
-            done.push((key, item));
-        }
-        let node = unsafe {
-            Bound::from_owned_ptr_or_err(py, _PyDict_NewPresized(done.len() as ffi::Py_ssize_t))?
-                .cast_into_unchecked::<PyDict>()
-        };
-        for (key, item) in done {
-            node.set_item(key, item)?;
-        }
-        return Ok(Some(node.into_any()));
-    }
-    if kind == t_list() {
-        // Copied first, as the walk's ``list(value)`` does: the copy is
-        // private, so nothing can change the items being read.
-        let items =
-            unsafe { Bound::from_owned_ptr_or_err(py, ffi::PySequence_List(obj.as_ptr()))? };
-        let mut done = Vec::with_capacity(items.len()?);
-        for item in unsafe { borrowed_items(&items) } {
-            let item = unsafe { Bound::from_borrowed_ptr(py, *item) };
-            let Some(item) = quick_plain_node(py, &item, python_dialect, seen, depth + 1)? else {
-                return Ok(None);
-            };
-            done.push(item);
-        }
-        return Ok(Some(PyList::new(py, done)?.into_any()));
-    }
-    Ok(None)
 }
 
 /// ``to_plain``'s last step: the tree, frozen unless ``mutable``.
@@ -4689,29 +4316,10 @@ impl<'py> Encoder<'py, '_> {
     }
 
     fn text_reduce(&mut self, value: &B<'py>, kind: &B<'py>, frame: u32) -> Text<()> {
-        let py = self.py;
-        let recipe = if self.enum_member(kind)? {
-            self.enum_recipe(value, kind)?
-        } else {
-            None
-        };
-        let mut parts = match recipe {
-            Some(parts) => parts,
-            None => {
-                let Some(recipe) = self.reduced(value, kind)? else {
-                    return self.text_unreduced(value, frame);
-                };
-                if is_str(&recipe) {
-                    let module = kind.getattr(intern!(py, "__module__"))?;
-                    let path = format!("{}.{}", module.str()?.to_cow()?, recipe.str()?.to_cow()?);
-                    if self.verified_fast(&path, value) {
-                        return self.text_tagged("py/type", pystr(py, &path).as_any());
-                    }
-                    let path = self.env.verified_path.bind(py).call1((path, value))?;
-                    return self.text_tagged("py/type", &path);
-                }
-                recipe.try_iter()?.collect::<PyResult<Vec<_>>>()?
-            }
+        let mut parts = match self.recipe(value, kind)? {
+            Recipe::Unreduced => return self.text_unreduced(value, frame),
+            Recipe::Path(path) => return self.text_tagged("py/type", &path),
+            Recipe::Parts(parts) => parts,
         };
         let mark = self.alive.len();
         if is_unhashable(value)? || parts.iter().skip(2).any(|part| !part.is_none()) {

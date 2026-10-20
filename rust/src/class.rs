@@ -28,6 +28,17 @@ unsafe extern "C" {
     fn PyUnstable_Type_AssignVersionTag(kind: *mut ffi::PyTypeObject) -> std::ffi::c_int;
 }
 
+/// The class's version tag, assigned if it has none; 0 when out of tags.
+#[inline]
+pub fn version_tag(kind: *mut ffi::PyTypeObject) -> u32 {
+    unsafe {
+        if (*kind).tp_version_tag == 0 {
+            PyUnstable_Type_AssignVersionTag(kind);
+        }
+        (*kind).tp_version_tag
+    }
+}
+
 /// What a fact learned from a class assumed about it. CPython replaces a
 /// class's version tag whenever the class or a base changes, and never reuses
 /// one; but 3.13 and later rename a class (``__qualname__``) without a new tag,
@@ -41,38 +52,24 @@ impl Stamp {
     /// The class's current state, or ``None`` if it cannot change.
     pub fn of(class: &B<'_>) -> Option<Self> {
         let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
-        unsafe {
-            if ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_IMMUTABLETYPE) != 0 {
-                return None;
-            }
-            if (*kind).tp_version_tag == 0 {
-                // A class out of tags stays at 0, which never matches.
-                PyUnstable_Type_AssignVersionTag(kind);
-            }
-            let qualname = heap_qualname(kind);
-            Some(Self {
-                tag: (*kind).tp_version_tag,
-                qualname: (!qualname.is_null())
-                    .then(|| Py::from_borrowed_ptr(class.py(), qualname)),
-            })
+        if unsafe { ffi::PyType_HasFeature(kind, ffi::Py_TPFLAGS_IMMUTABLETYPE) } != 0 {
+            return None;
         }
+        Some(Self::always(class))
     }
 
     /// The class's current state, immutable classes included. A fact kept
     /// across calls by class address needs this: version tags are never
     /// reused, so a new class that takes a dead one's address never matches.
+    /// A class out of tags stays at 0, which never matches.
     pub fn always(class: &B<'_>) -> Self {
         let kind = class.as_ptr().cast::<ffi::PyTypeObject>();
-        unsafe {
-            if (*kind).tp_version_tag == 0 {
-                PyUnstable_Type_AssignVersionTag(kind);
-            }
-            let qualname = heap_qualname(kind);
-            Self {
-                tag: (*kind).tp_version_tag,
-                qualname: (!qualname.is_null())
-                    .then(|| Py::from_borrowed_ptr(class.py(), qualname)),
-            }
+        let tag = version_tag(kind);
+        let qualname = unsafe { heap_qualname(kind) };
+        Self {
+            tag,
+            qualname: (!qualname.is_null())
+                .then(|| unsafe { Py::from_borrowed_ptr(class.py(), qualname) }),
         }
     }
 
@@ -205,15 +202,6 @@ pub struct ClassInfo {
     /// Whether its instances' ``__reduce_ex__(2)`` is ``object``'s own calling
     /// a custom ``__reduce__``, so the call can be made without Python's.
     pub own_reduce: Option<bool>,
-    /// The ``__dict__`` keys of the last instance read, by identity, and the
-    /// order sorting gave them; instances of one class usually share both.
-    pub dict_order: Option<DictOrder>,
-}
-
-/// The keys one instance's ``__dict__`` held, and the order they sort in.
-pub struct DictOrder {
-    pub keys: Vec<Py<PyAny>>,
-    pub sorted: Vec<usize>,
 }
 
 /// A class's slots, as ``attribute_names`` names them, and where each lives.
@@ -392,6 +380,30 @@ pub fn generic_getattr(kind: *mut ffi::PyTypeObject) -> bool {
     unsafe { (*kind).tp_getattro }.map(|f| f as usize) == generic_getattr_slot()
 }
 
+/// The slot ``found`` describes for instances of ``kind``, if it is a member
+/// descriptor that applies to them. A class can install another class's
+/// member descriptor under a slot name; its offset is not an offset in this
+/// instance, so that descriptor is left to ``getattr``, which enforces
+/// ownership, rather than read as arbitrary memory.
+///
+/// # Safety
+/// ``kind`` is a live class; ``found`` is null or a live object.
+pub unsafe fn member_of(
+    kind: *mut ffi::PyTypeObject,
+    found: *mut ffi::PyObject,
+) -> *mut ffi::PyMemberDef {
+    unsafe {
+        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
+            return std::ptr::null_mut();
+        }
+        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
+        if ffi::PyType_IsSubtype(kind, (*descriptor).d_common.d_type) == 0 {
+            return std::ptr::null_mut();
+        }
+        (*descriptor).d_member.cast::<ffi::PyMemberDef>()
+    }
+}
+
 /// The offset of the object member ``kind``'s MRO finds first under
 /// ``name``, when it has none of the ``refused`` flags.
 fn member_offset(
@@ -403,19 +415,11 @@ fn member_offset(
         return None;
     }
     unsafe {
-        let found = type_lookup(kind, name.as_ptr());
-        if found.is_null() || ob_type(found) != &raw mut ffi::PyMemberDescr_Type {
-            return None;
-        }
-        let descriptor = found.cast::<ffi::PyMemberDescrObject>();
-        // A class can install another class's member descriptor under a slot
-        // name. Its offset is not an offset in this instance; let getattr
-        // enforce descriptor ownership rather than reading arbitrary memory.
-        if ffi::PyType_IsSubtype(kind, (*descriptor).d_common.d_type) == 0 {
-            return None;
-        }
-        let member = (*descriptor).d_member.cast::<ffi::PyMemberDef>();
-        if (*member).type_code != ffi::Py_T_OBJECT_EX || (*member).flags & refused != 0 {
+        let member = member_of(kind, type_lookup(kind, name.as_ptr()));
+        if member.is_null()
+            || (*member).type_code != ffi::Py_T_OBJECT_EX
+            || (*member).flags & refused != 0
+        {
             return None;
         }
         Some((*member).offset)
@@ -542,7 +546,7 @@ unsafe fn is_name(key: *mut ffi::PyObject, name: *mut ffi::PyObject) -> bool {
     unsafe {
         key == name
             || (ob_type(key) == t_str()
-                && utf8_raw(key).is_some_and(|text| Some(text) == utf8_raw(name)))
+                && utf8_ptr(key).is_some_and(|text| Some(text) == utf8_ptr(name)))
     }
 }
 
@@ -681,7 +685,7 @@ pub unsafe fn own_offsets(
             {
                 return None;
             }
-            let text = utf8_raw(name)?;
+            let text = utf8_ptr(name)?;
             if text.starts_with(b"__") || text.starts_with(b"py/") || text.starts_with(b"json://") {
                 return None;
             }

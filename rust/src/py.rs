@@ -289,12 +289,6 @@ pub fn tp(obj: &B<'_>) -> *mut ffi::PyTypeObject {
     ob_type(obj.as_ptr())
 }
 
-/// ``Py_TYPE(ptr)``, read in place (see ``ob_type``).
-#[inline(always)]
-pub fn tp_ptr(obj: *mut ffi::PyObject) -> *mut ffi::PyTypeObject {
-    ob_type(obj)
-}
-
 macro_rules! type_ptr {
     ($name:ident, $sym:ident) => {
         #[inline(always)]
@@ -441,32 +435,6 @@ pub unsafe fn ascii_bytes<'a>(raw: *mut ffi::PyObject) -> &'a [u8] {
     unsafe {
         let ascii = raw.cast::<ffi::PyASCIIObject>();
         std::slice::from_raw_parts(ascii.add(1).cast::<u8>(), (*ascii).length as usize)
-    }
-}
-
-/// ``utf8`` for a raw str pointer, with no reference taken; the bytes live
-/// as long as the str.
-///
-/// # Safety
-/// ``raw`` is a live ``str``, held for as long as the bytes are used.
-#[inline]
-pub unsafe fn utf8_raw<'a>(raw: *mut ffi::PyObject) -> Option<&'a [u8]> {
-    unsafe {
-        if compact_ascii(raw) {
-            let ascii = raw.cast::<ffi::PyASCIIObject>();
-            let length = (*ascii).length as usize;
-            return Some(std::slice::from_raw_parts(
-                ascii.add(1).cast::<u8>(),
-                length,
-            ));
-        }
-        let mut size: ffi::Py_ssize_t = 0;
-        let data = ffi::PyUnicode_AsUTF8AndSize(raw, &mut size);
-        if data.is_null() {
-            ffi::PyErr_Clear();
-            return None;
-        }
-        Some(std::slice::from_raw_parts(data.cast::<u8>(), size as usize))
     }
 }
 

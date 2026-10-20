@@ -20,8 +20,11 @@ use pyo3::types::{
     PyWeakrefReference,
 };
 
-use crate::attrs::{FieldSlots, HasTable, SetTable, member_of, type_lookup};
-use crate::class::{_PyType_Lookup, Stamp, object_new, own_namespace, store_offsets};
+use crate::attrs::{FieldSlots, HasTable, SetTable};
+use crate::class::{
+    _PyType_Lookup, Stamp, member_of, object_new, own_namespace, store_offsets, type_lookup,
+    version_tag,
+};
 use crate::errors::*;
 use crate::places::{Loc, Paths, PlacedTable, ROOT, Spare, StepRef};
 use crate::py::*;
@@ -183,8 +186,6 @@ pub struct DecGlobals {
     pending: Py<PyAny>,
     absent: Py<PyAny>,
     object: Py<PyAny>,
-    /// ``object.__new__``.
-    object_new: Py<PyAny>,
     mappingproxy: Py<PyAny>,
     mapping: Py<PyAny>,
     sequence: Py<PyAny>,
@@ -400,7 +401,6 @@ pub fn setup(module: &Bound<'_, PyDict>) -> PyResult<()> {
         pending: get("PENDING")?,
         absent: get("ABSENT")?,
         object: builtins.getattr("object")?.unbind(),
-        object_new: builtins.getattr("object")?.getattr("__new__")?.unbind(),
         mappingproxy: get("MappingProxyType")?,
         mapping: get("Mapping")?,
         sequence: get("Sequence")?,
@@ -1565,31 +1565,19 @@ impl<'py, 'g> Decoder<'py, 'g> {
     /// while the class is unchanged and its lookup is standard.
     fn allocate(&mut self, kind: &B<'py>) -> PyResult<B<'py>> {
         let py = self.py;
-        let key = kind.as_ptr() as usize;
         let raw = kind.as_ptr().cast::<ffi::PyTypeObject>();
-        let tag = crate::attrs::version_tag(raw);
+        // ``object.__new__(kind)`` is its slot called with no arguments.
+        if let Some(new) = object_new(kind) {
+            let made = unsafe { new(raw, PyTuple::empty(py).as_ptr(), std::ptr::null_mut()) };
+            return unsafe { Bound::from_owned_ptr_or_err(py, made) };
+        }
+        let key = kind.as_ptr() as usize;
+        let tag = version_tag(raw);
         // As in ``set_table``: the tag alone identifies the class.
         if let Some((_, stamped, func)) = self.caches.news.get(&key)
             && *stamped != 0
             && *stamped == tag
         {
-            // Perf: rows from_plain, lockstep: 2.4-2.9x (calling the slot before the cache fill
-            // kept the RowFacts quick path from ever running); rows json_loads ~2.6x;
-            // bench_configs decode 0.88x on a noisy run.
-            // ``object.__new__(kind)`` under a plain ``type`` metaclass, for a
-            // class keeping ``object``'s ``tp_new``, is that slot called with
-            // no arguments.
-            let base = &raw mut ffi::PyBaseObject_Type;
-            unsafe {
-                if func.bind(py).is(self.g.object_new.bind(py))
-                    && ob_type(kind.as_ptr()) == &raw mut ffi::PyType_Type
-                    && (*raw).tp_new.map(|f| f as usize) == (*base).tp_new.map(|f| f as usize)
-                    && let Some(new) = (*base).tp_new
-                {
-                    let made = new(raw, PyTuple::empty(py).as_ptr(), std::ptr::null_mut());
-                    return Bound::from_owned_ptr_or_err(py, made);
-                }
-            }
             return func.bind(py).call1((kind,));
         }
         let func = kind.getattr(pyo3::intern!(py, "__new__"))?;
@@ -2075,7 +2063,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 .upgrade()
                 .is_some_and(|alive| alive.is(target))
             && *tag != 0
-            && *tag == crate::attrs::version_tag(target.as_ptr().cast())
+            && *tag == version_tag(target.as_ptr().cast())
         {
             let mut holds = true;
             for guard in guards.iter() {
@@ -2146,7 +2134,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
                 && let Some(guards) = self.hint_guards(target)?
                 && let Ok(weak) = PyWeakrefReference::new(target)
             {
-                let tag = crate::attrs::version_tag(target.as_ptr().cast());
+                let tag = version_tag(target.as_ptr().cast());
                 if tag == 0 {
                     return Ok(info);
                 }
@@ -4192,7 +4180,7 @@ impl<'py, 'g> Decoder<'py, 'g> {
             },
         };
         let kind = target.as_ptr().cast::<ffi::PyTypeObject>();
-        let tag = crate::attrs::version_tag(kind);
+        let tag = version_tag(kind);
         // ``kind.__new__(kind)`` is ``object.__new__``'s ``tp_alloc`` exactly
         // when lookup finds ``object.__new__`` (``object_new``), the class
         // keeps ``object``'s ``tp_new``, and it is not abstract. Heap classes
@@ -4237,10 +4225,10 @@ impl<'py, 'g> Decoder<'py, 'g> {
             } else {
                 texts.push((data.cast::<u8>(), size as usize));
             }
-            let setter = match unsafe { type_lookup(kind, name.as_ptr()) } {
-                None => None,
-                Some(found) if found.is_null() => has_dict.then(std::ptr::null_mut),
-                Some(found) => unsafe {
+            let found = unsafe { type_lookup(kind, name.as_ptr()) };
+            let setter = match found {
+                found if found.is_null() => has_dict.then(std::ptr::null_mut),
+                found => unsafe {
                     let member = member_of(kind, found);
                     if !member.is_null() {
                         ((*member).type_code == ffi::Py_T_OBJECT_EX
@@ -6306,7 +6294,7 @@ impl<'py> Exec<'_, 'py> {
             let field = match rec.info.slot_at(at, key, py) {
                 Some(field) => field,
                 // ``py/object`` as a str not interned; no field has that name.
-                None if unsafe { utf8_raw(key) } == Some(b"py/object".as_slice()) && !stored => {
+                None if unsafe { utf8_ptr(key) } == Some(b"py/object".as_slice()) && !stored => {
                     let path = unsafe { Bound::from_borrowed_ptr(py, each) };
                     if text_of(&path) != Some(&*rec.own) {
                         return Err(Stop::Abort);
@@ -7135,7 +7123,7 @@ fn holds_tags<'py>(g: &DecGlobals, data: &B<'py>) -> PyResult<bool> {
         let mut value = std::ptr::null_mut();
         if unsafe { ffi::PyDict_Next(data.as_ptr(), &mut position, &mut key, &mut value) } != 0
             && ob_type(key) == t_str()
-            && unsafe { utf8_raw(key) }.is_some_and(|text| text.starts_with(b"py/"))
+            && unsafe { utf8_ptr(key) }.is_some_and(|text| text.starts_with(b"py/"))
         {
             return Ok(true);
         }

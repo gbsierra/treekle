@@ -95,7 +95,8 @@ def json_loads(
             strict=strict,
         )
     tree = cast(
-        "MutablePlainTree", json.loads(text) if _loads is None else _loads(text)
+        "MutablePlainTree",
+        json.loads(text) if _loads is None else _loads(text),
     )
     if target is ABSENT:
         return tree

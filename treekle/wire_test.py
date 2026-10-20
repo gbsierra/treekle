@@ -106,7 +106,7 @@ class TestJsonDumps:
         assert json_dumps(math.inf) == '{"py/float": "inf"}'
         attributes = AttributeOrder()
         assert json_dumps(attributes, sort=False) == json.dumps(
-            to_plain(attributes, sort=False)
+            to_plain(attributes, sort=False),
         )
         assert json_dumps(attributes) != json_dumps(attributes, sort=False)
 
